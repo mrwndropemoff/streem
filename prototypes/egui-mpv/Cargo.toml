@@ -1,0 +1,13 @@
+[package]
+name = "egui-mpv-prototype"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# Defaults off: they pull in wgpu, and libmpv can only draw through OpenGL.
+eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+libmpv2 = "7.0.1"
+
+# Keep this folder out of any future parent workspace.
+[workspace]
