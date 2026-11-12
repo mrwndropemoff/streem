@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use super::types::Manifest;
+use super::types::{Manifest, MetaPreview};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AddonError {
@@ -16,6 +16,8 @@ pub enum AddonError {
     Status(u16),
     #[error("the addon's manifest is not valid: {0}")]
     InvalidManifest(#[from] serde_json::Error),
+    #[error("the addon's catalog is not valid: {0}")]
+    InvalidCatalog(serde_json::Error),
 }
 
 /// Turns what the user typed into the URL that identifies the **addon**.
@@ -62,6 +64,52 @@ pub async fn fetch_manifest(
     let text = response.text().await?;
     let manifest = parse_manifest(&text)?;
     Ok((manifest, text))
+}
+
+/// The URL of a catalog: `{base}/catalog/{type}/{id}.json`, where `{base}` is the manifest URL
+/// without `/manifest.json`. `{type}` and `{id}` are percent-encoded.
+pub fn catalog_url(
+    manifest_url: &str,
+    meta_type: &str,
+    catalog_id: &str,
+) -> Result<String, AddonError> {
+    let mut url = reqwest::Url::parse(manifest_url)
+        .map_err(|_| AddonError::InvalidUrl(manifest_url.into()))?;
+    url.set_query(None);
+    url.set_fragment(None);
+    url.path_segments_mut()
+        .map_err(|()| AddonError::InvalidUrl(manifest_url.into()))?
+        .pop()
+        .push("catalog")
+        .push(meta_type)
+        .push(&format!("{catalog_id}.json"));
+    Ok(url.into())
+}
+
+/// Downloads the first page of a catalog. An entry that lacks an id, type or name is skipped,
+/// so one bad entry does not hide the rest.
+pub async fn fetch_catalog(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<Vec<MetaPreview>, AddonError> {
+    // shortcut: first page only, add the "skip" extra when rows need to scroll further
+    #[derive(serde::Deserialize)]
+    struct Response {
+        metas: Vec<serde_json::Value>,
+    }
+
+    let response = client.get(url).send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(AddonError::Status(status.as_u16()));
+    }
+    let text = response.text().await?;
+    let parsed: Response = serde_json::from_str(&text).map_err(AddonError::InvalidCatalog)?;
+    Ok(parsed
+        .metas
+        .into_iter()
+        .filter_map(|meta| serde_json::from_value(meta).ok())
+        .collect())
 }
 
 #[cfg(test)]

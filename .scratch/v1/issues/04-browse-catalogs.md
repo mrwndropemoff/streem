@@ -81,13 +81,13 @@ Clicking a poster, search, continue-watching, pagination.
 
 ## Acceptance checks
 
-- [ ] `cargo test -p streem-core` passes, including tests against a `wiremock` server that: two catalogs produce two rows that go from `Loading` to `Ready`; one **addon** returning HTTP 500 gives one `Failed` row while the other is `Ready`; a catalog with a required extra produces no row; requesting the same poster twice makes exactly one HTTP request; a new `Core` on the same data directory serves that poster with zero HTTP requests.
-- [ ] `cargo run -p streem-desktop` shows Cinemeta's rows with posters.
-- [ ] `grep -rn "reqwest\|rusqlite\|std::fs" crates/desktop/src` prints nothing.
+- [x] `cargo test -p streem-core` passes, including tests against a `wiremock` server that: two catalogs produce two rows that go from `Loading` to `Ready`; one **addon** returning HTTP 500 gives one `Failed` row while the other is `Ready`; a catalog with a required extra produces no row; requesting the same poster twice makes exactly one HTTP request; a new `Core` on the same data directory serves that poster with zero HTTP requests.
+- [x] `cargo run -p streem-desktop` shows Cinemeta's rows with posters.
+- [x] `grep -rn "reqwest\|rusqlite\|std::fs" crates/desktop/src` prints nothing.
 
 ## Human check
 
-- [ ] Scrolling vertically and horizontally stays smooth while posters are still loading.
+- [x] Scrolling vertically and horizontally stays smooth while posters are still loading.
 
 ## Rules
 
@@ -100,3 +100,18 @@ Clicking a poster, search, continue-watching, pagination.
 - When done, tick the boxes and add a line under `## Comments` saying what you verified and how.
 
 ## Comments
+**Notes for later tickets**
+- Protocol types stay our own (`addon/types.rs`), following ticket 03: added `ManifestCatalog.extra` (`ManifestExtra { name, is_required }`) and `MetaPreview`. A catalog entry without an id, type or name is skipped; the rest of the row still shows.
+- `Core` reloads the home rows by itself after every finished disk job: the first load at startup, an install and a removal. That retries `Failed` rows too. So the desktop never has to guess when the list is ready (at startup `State.addons` is still empty). `Command::LoadHome` forces a reload; nothing in the desktop sends it yet because the ticket adds no refresh control.
+- Each reload bumps a generation number; answers from an earlier generation are dropped, so a slow fetch from before a removal cannot touch the new rows.
+- A catalog row's name is the catalog's `name`, or its `id` when the manifest gives none.
+- A catalog answer without a `metas` list is a `Failed` row; an `extra` entry with no name or a null `isRequired` is tolerated so it cannot make a manifest unreadable.
+- Posters: `Core::poster` looks in a cache shared with the UI thread (`posters::PosterCache`); the first ask sends a message to the app task, which downloads and decodes in the background and calls `on_change`. A poster that fails to load stays `None` for the rest of the run and is not retried (otherwise the UI would retry every frame). An unreadable saved file is downloaded again.
+- The desktop keeps one egui texture per poster URL and only asks for posters whose cell is visible.
+
+**Verified**
+- `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`: all pass (10 unit tests, 18 integration tests, 1 ignored). The extra tests written first were trimmed afterwards so the tests match this ticket's acceptance checks, as the spec's "Testing decisions" asks.
+- Tests against `wiremock`: two catalogs go `Loading` then `Ready`; HTTP 500 gives one `Failed` row while the other is `Ready`; a required extra gives no row; the same poster requested twice makes one request and arrives scaled to 300 px wide; a new `Core` on the same data directory serves it with no request.
+- `cargo run -p streem-desktop` with an empty `STREEM_DATA_DIR` on Windows 11: screenshot shows Cinemeta's rows ("Popular · movie", "Popular · series", "Featured · movie") with posters and names, and 31 files in `<data_dir>/posters`. The Home/Addons top bar was not clicked in the real window.
+- `grep -rn "reqwest\|rusqlite\|std::fs" crates/desktop/src` prints nothing.
+- Human check done by the user: vertical and horizontal scrolling stayed smooth while posters loaded, and the Home/Addons top bar worked. All posters loaded in their run; the failed-poster case was not seen.

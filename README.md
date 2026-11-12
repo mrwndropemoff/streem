@@ -2,7 +2,7 @@
 
 A Stremio-like media centre for family and friends. It installs **addons** (remote services that speak the Stremio addon protocol), browses their catalogs and plays their streams. Planned differences from Stremio: several **profiles** under one **account**, everything synced over the internet, and **watch parties**.
 
-> **Status: early development.** Today the desktop app only manages addons: it installs an addon from a URL, lists installed addons, and removes them. Catalog browsing, playback, sync, profiles and watch parties are planned but not built yet (see [Roadmap](#roadmap)).
+> **Status: early development.** Today the desktop app has two screens: Home, which shows one row of posters for each catalog offered by your installed addons, and Addons, where you install an addon from a URL, list installed addons, and remove them. Opening a title, playback, search, sync, profiles and watch parties are planned but not built yet (see [Roadmap](#roadmap)).
 
 Target platforms: Linux (Wayland) and Windows. It is written entirely in Rust.
 
@@ -26,7 +26,7 @@ The main app (`crates/core` + `crates/desktop`) needs only a Rust toolchain.
 | **Rust** (stable, with Cargo). The project uses the 2024 edition, so Rust 1.85 or newer. Developed with 1.99. | Builds everything | Install with [rustup](https://rustup.rs). Check with `cargo --version`. |
 | **Windows only:** MSVC build tools | Rust on Windows links with Microsoft's linker | Install "Visual Studio Build Tools" with the *Desktop development with C++* workload. |
 | **Linux only:** a C compiler and a graphical session (Wayland or X11) with OpenGL | The bundled SQLite is compiled from C, and the window draws with OpenGL | e.g. `build-essential` on Debian/Ubuntu, `base-devel` on Arch. Your distro's Mesa/GPU drivers provide OpenGL. |
-| **Internet access** | The first launch installs the default addon (Cinemeta), and installing any addon downloads its manifest | None needed. The tests run offline, apart from one opt-in test. |
+| **Internet access** | The first launch installs the default addon (Cinemeta), installing any addon downloads its manifest, and the Home screen fetches catalogs and poster images | None needed. The tests run offline, apart from one opt-in test. |
 
 You do **not** need libmpv, ffmpeg, Supabase or a Real-Debrid account to run the app as it is today. Those only matter for features that are not built yet, or for the optional prototype below.
 
@@ -75,7 +75,7 @@ This is also a handy way to get a clean first launch: point it at an empty folde
 cargo test --workspace
 ```
 
-The tests live in `crates/core` and use a fake local web server (`wiremock`) and temporary folders, so they run offline and never touch your real data. They cover installing and removing addons, error notices, restarts (data survives), cancelling an install whose addon is removed mid-download, and first-launch defaults.
+The tests live in `crates/core` and use a fake local web server (`wiremock`) and temporary folders, so they run offline and never touch your real data. They cover installing and removing addons, error notices, restarts (data survives), cancelling an install whose addon is removed mid-download, first-launch defaults, the Home catalog rows (loading, ready, one failing addon, catalogs that need extra input are left out), and poster caching (one request per poster, none after a restart).
 
 One extra test downloads the real Cinemeta manifest from the internet and is skipped by default:
 
@@ -85,7 +85,7 @@ cargo test -p streem-core -- --ignored
 
 ## Where your data is stored
 
-Streem keeps a single SQLite file, `streem.db`, in its data folder:
+Streem keeps a single SQLite file, `streem.db`, in its data folder, plus a `posters/` folder with the original poster images it has downloaded, so it never downloads the same poster twice:
 
 | OS | Default folder |
 |---|---|
@@ -137,17 +137,18 @@ The central design rule: **the UI never does network or disk work.** `desktop` s
 
 ### `crates/core` — the engine (`streem-core`)
 
-No UI code. Dependencies include `reqwest` (HTTP), `rusqlite` (bundled SQLite), `tokio` (async runtime), `serde` (JSON) and `thiserror` (errors).
+No UI code. Dependencies include `reqwest` (HTTP), `rusqlite` (bundled SQLite), `image` (poster decoding), `tokio` (async runtime), `serde` (JSON) and `thiserror` (errors).
 
 | File | What it does |
 |---|---|
-| `src/lib.rs` | The public face of the crate. Defines `Core` (the running engine), `Command` (what the UI can ask for: `InstallAddon`, `RemoveAddon`, `DismissNotice`), `State` (everything the UI draws: the addon list and an optional notice) and `Notice` (a message for the user). `Core::start` launches the background thread and installs Cinemeta on first launch; dropping `Core` stops it cleanly, after saving pending work. |
+| `src/lib.rs` | The public face of the crate. Defines `Core` (the running engine), `Command` (what the UI can ask for: `InstallAddon`, `RemoveAddon`, `DismissNotice`, `LoadHome`), `State` (everything the UI draws: the addon list, the Home catalog rows and an optional notice) and `Notice` (a message for the user). `Core::poster` hands the UI a decoded poster once it is ready. `Core::start` launches the background thread and installs Cinemeta on first launch; dropping `Core` stops it cleanly, after saving pending work. |
 | `src/app.rs` | The single background task that owns the mutable state. It receives commands and the results of its own network/disk jobs as messages, updates `State`, publishes it, and calls the UI's `on_change` callback. It never blocks on network or disk, and handles edge cases such as cancelling an install when the addon is removed mid-download. |
+| `src/posters.rs` | Poster images. Downloads each image once, saves the original bytes under `<data folder>/posters/`, decodes and scales it to at most 300 pixels wide on a blocking task, and keeps the result in memory. A saved poster is never downloaded again, in this run or a later one. |
 | `src/store.rs` | Local SQLite storage in `streem.db`. Opens the file, runs numbered migrations (append new ones, never edit old ones), and saves, loads and removes addon rows. Columns such as `deleted`, `dirty` and `updated_at` are already there for the future sync feature. |
 | `src/addon/mod.rs` | Declares the `addon` module's two submodules. |
-| `src/addon/types.rs` | Rust types for the Stremio addon manifest (name, version, resources, catalogs…). Only the fields the app uses are read; unknown fields are ignored. Shapes follow `stremio-core` (MIT). |
-| `src/addon/client.rs` | Talks to addons over HTTP: turns `stremio://` links into `https://`, rejects URLs that are not `manifest.json` links, downloads the manifest and parses it. |
-| `tests/core.rs` | Black-box tests of `Core`: send commands, check the resulting `State`. Uses a mock web server and temporary folders. |
+| `src/addon/types.rs` | Rust types for the Stremio addon manifest (name, version, resources, catalogs and their `extra` options, catalog entries). Only the fields the app uses are read; unknown fields are ignored. Shapes follow `stremio-core` (MIT). |
+| `src/addon/client.rs` | Talks to addons over HTTP: turns `stremio://` links into `https://`, rejects URLs that are not `manifest.json` links, downloads the manifest and parses it, and fetches the first page of a catalog (`/catalog/<type>/<id>.json`). |
+| `tests/core.rs` | Black-box tests of `Core`: send commands, check the resulting `State`. Uses a mock web server and temporary folders. Covers the Home rows and posters too. |
 
 ### `crates/desktop` — the window (`streem-desktop`)
 
@@ -155,8 +156,9 @@ Built with [egui](https://github.com/emilk/egui) through `eframe`, using the Ope
 
 | File | What it does |
 |---|---|
-| `src/main.rs` | Program entry point. Opens the "Streem" window, starts `Core` (pointing it at the data folder, or `STREEM_DATA_DIR`), and each frame draws the notice banner and the Addons screen from the latest `State`. |
+| `src/main.rs` | Program entry point. Opens the "Streem" window, starts `Core` (pointing it at the data folder, or `STREEM_DATA_DIR`), and each frame draws the notice banner, a Home/Addons top bar and the chosen screen from the latest `State`. |
 | `src/screens/mod.rs` | Groups the screens and holds shared UI pieces, such as the dismissible red notice banner at the top of the window. |
+| `src/screens/home.rs` | The Home screen: a vertical list of catalog rows, each a title and a horizontal strip of posters with names. It asks `Core` for a poster only when its cell is on screen, draws a grey placeholder until it arrives, and keeps one egui texture per poster URL. Loading rows show placeholders and failed rows show their message. |
 | `src/screens/addons.rs` | The Addons screen: the URL field and **Install** button, the scrolling list of installed addons (name, version, description), and a **Remove** button on each. It only sends `Command`s; it never does I/O itself. |
 
 ### `prototypes/egui-mpv` — throwaway experiment
@@ -196,14 +198,14 @@ cargo run --release -- sample/sample.mkv
 | File | What it does |
 |---|---|
 | `spec.md` | The v1 specification: what the app is, key decisions, the two-crate rule, accounts/profiles/overrides, Real-Debrid via addons, sync, watch parties, build order and open risks. **Read this first** to understand where the project is going. |
-| `issues/01` … `issues/22` | One ticket per piece of work, each with a `Status:` line (e.g. `ready-for-agent`, `ready-for-human`). Tickets 01 to 03 have been worked on (their `Status:` lines may lag behind the code); the rest are the backlog. |
+| `issues/01` … `issues/22` | One ticket per piece of work, each with a `Status:` line (e.g. `ready-for-agent`, `ready-for-human`). Tickets 01 to 04 have been worked on (their `Status:` lines may lag behind the code); the rest are the backlog. |
 
 ## Roadmap
 
 From the spec, in build order (v1 is steps 1 to 5):
 
 1. **Prototype:** egui plays video through libmpv. *Done: egui was chosen.*
-2. **Browse and play:** workspace and addon install *(done)*, then catalogs, title details, stream list, playback, search, subtitles. *In progress.*
+2. **Browse and play:** workspace and addon install *(done)*, catalogs on the Home screen *(done)*, then title details, stream list, playback, search, subtitles. *In progress.*
 3. **Real-Debrid:** a `{real_debrid_key}` placeholder in addon URLs (Real-Debrid itself is handled by addons such as Torrentio; the app has no torrent engine).
 4. **Account and profiles:** sign-up/sign-in, profile picker, per-profile overrides, history, continue-watching and library, all synced through Supabase.
 5. **Watch party:** shared play/pause/seek between profiles of one account.

@@ -56,6 +56,44 @@ pub struct ManifestCatalog {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub extra: Vec<ManifestExtra>,
+}
+
+impl ManifestCatalog {
+    /// What the home screen shows: the catalog's name, or its id when it has none.
+    pub fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.id)
+    }
+
+    /// The home screen can only show a catalog that can be requested with no extra properties.
+    pub fn has_required_extra(&self) -> bool {
+        self.extra
+            .iter()
+            .any(|extra| extra.is_required == Some(true))
+    }
+}
+
+/// An `extra` entry of a catalog, such as `skip`, `genre` or `search`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestExtra {
+    /// Lenient on purpose: an odd `extra` entry must not make the whole manifest unreadable.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub is_required: Option<bool>,
+}
+
+/// One entry of a catalog response: enough to draw a poster.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MetaPreview {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub meta_type: String,
+    pub name: String,
+    #[serde(default)]
+    pub poster: Option<String>,
 }
 
 #[cfg(test)]

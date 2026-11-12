@@ -8,8 +8,16 @@ use std::path::PathBuf;
 use eframe::egui;
 use streem_core::Core;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Home,
+    Addons,
+}
+
 struct App {
     core: Core,
+    screen: Screen,
+    home: screens::home::HomeScreen,
     addons: screens::addons::AddonsScreen,
 }
 
@@ -19,6 +27,8 @@ impl App {
         let core = Core::start(data_dir(), move || egui_ctx.request_repaint());
         App {
             core,
+            screen: Screen::Home,
+            home: Default::default(),
             addons: Default::default(),
         }
     }
@@ -28,8 +38,15 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let state = self.core.state();
         screens::notice_banner(ui, &state, &self.core);
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.addons.ui(ui, &state, &self.core);
+        egui::Panel::top("navigation").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.screen, Screen::Home, "Home");
+                ui.selectable_value(&mut self.screen, Screen::Addons, "Addons");
+            });
+        });
+        egui::CentralPanel::default().show(ui, |ui| match self.screen {
+            Screen::Home => self.home.ui(ui, &state, &self.core),
+            Screen::Addons => self.addons.ui(ui, &state, &self.core),
         });
     }
 }
