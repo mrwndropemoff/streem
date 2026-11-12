@@ -1,6 +1,7 @@
 pub mod addons;
 pub mod details;
 pub mod home;
+pub mod player;
 
 use std::collections::HashMap;
 

@@ -109,7 +109,9 @@ impl DetailsScreen {
         if details.meta_type == "movie" {
             ui.add_space(16.0);
             // Asked for as soon as the details were ready, so a missing list is on its way.
-            stream_list(ui, streams, None);
+            if let Some(play) = stream_list(ui, streams, None) {
+                core.send(play);
+            }
         } else if !seasons.is_empty() {
             ui.add_space(16.0);
             ui.columns(2, |columns| {
@@ -122,11 +124,10 @@ impl DetailsScreen {
                 if let Some(video_id) = clicked {
                     core.send(Command::LoadStreams { video_id });
                 }
-                stream_list(
-                    &mut columns[1],
-                    streams,
-                    Some("Choose an episode to see its streams."),
-                );
+                let waiting = Some("Choose an episode to see its streams.");
+                if let Some(play) = stream_list(&mut columns[1], streams, waiting) {
+                    core.send(play);
+                }
             });
         }
     }
@@ -222,8 +223,12 @@ impl DetailsScreen {
 }
 
 /// The streams under each **addon**'s name. `waiting` is shown while no streams were asked
-/// for; without it, a spinner is.
-fn stream_list(ui: &mut egui::Ui, streams: Option<&StreamList>, waiting: Option<&str>) {
+/// for; without it, a spinner is. Returns the `Play` command for the stream the person clicked.
+fn stream_list(
+    ui: &mut egui::Ui,
+    streams: Option<&StreamList>,
+    waiting: Option<&str>,
+) -> Option<Command> {
     ui.heading("Streams");
     ui.add_space(4.0);
     let Some(list) = streams else {
@@ -235,12 +240,13 @@ fn stream_list(ui: &mut egui::Ui, streams: Option<&StreamList>, waiting: Option<
                 ui.spinner();
             }
         }
-        return;
+        return None;
     };
     if list.groups.is_empty() {
         ui.weak("No installed addon has streams for this.");
-        return;
+        return None;
     }
+    let mut play = None;
     for group in &list.groups {
         ui.add_space(8.0);
         ui.strong(&group.addon_name);
@@ -252,29 +258,54 @@ fn stream_list(ui: &mut egui::Ui, streams: Option<&StreamList>, waiting: Option<
                 ui.colored_label(egui::Color32::LIGHT_RED, message);
             }
             Load::Ready(items) => {
-                for item in items {
-                    stream_row(ui, item);
+                for (index, item) in items.iter().enumerate() {
+                    if stream_row(ui, item) {
+                        play = Some(Command::Play {
+                            addon_id: group.addon_id.clone(),
+                            stream_index: index,
+                        });
+                    }
                 }
             }
         }
     }
+    play
 }
 
 /// One stream: its name and description. An unplayable one is greyed out with the reason.
-/// Clicking a playable one does nothing yet.
-fn stream_row(ui: &mut egui::Ui, item: &StreamItem) {
-    ui.add_enabled_ui(item.playable, |ui| {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal_top(|ui| {
-                ui.strong(&item.name);
-                ui.label(&item.description);
-            });
-            if let Some(reason) = &item.unplayable_reason {
-                ui.label(reason);
-            }
-        });
+/// Returns true when a playable one was clicked.
+fn stream_row(ui: &mut egui::Ui, item: &StreamItem) -> bool {
+    let shown = ui.add_enabled_ui(item.playable, |ui| {
+        egui::Frame::group(ui.style())
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_top(|ui| {
+                    ui.strong(&item.name);
+                    ui.label(&item.description);
+                });
+                if let Some(reason) = &item.unplayable_reason {
+                    ui.label(reason);
+                }
+            })
+            .response
+            .rect
     });
+    if !item.playable {
+        return false;
+    }
+    let rect = shown.inner;
+    let response = ui
+        .interact(rect, ui.next_auto_id(), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.hovered() {
+        ui.painter().rect_stroke(
+            rect,
+            4.0,
+            ui.visuals().widgets.hovered.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+    response.clicked()
 }
 
 /// The seasons the videos belong to, ascending, with season 0 (specials) last.

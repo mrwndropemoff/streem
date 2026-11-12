@@ -7,4 +7,5 @@ publish = false
 [dependencies]
 dirs = "7.0.0"
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+libmpv2 = "7.0.1"
 streem-core = { version = "0.0.0", path = "../core" }

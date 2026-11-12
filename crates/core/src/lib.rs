@@ -3,6 +3,7 @@
 
 pub mod addon;
 mod app;
+mod playback;
 mod posters;
 mod store;
 
@@ -19,7 +20,7 @@ pub use posters::Poster;
 const CINEMETA_URL: &str = "https://v3-cinemeta.strem.io/manifest.json";
 
 /// A request from the UI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     InstallAddon {
         url: String,
@@ -44,10 +45,27 @@ pub enum Command {
     LoadStreams {
         video_id: String,
     },
+    /// Plays one stream of the open title's current stream list: `stream_index` counts within
+    /// the group of the **addon** with id `addon_id`. Ignored when there is no such stream or it
+    /// is not playable.
+    Play {
+        addon_id: String,
+        stream_index: usize,
+    },
+    /// Pauses or resumes. Ignored when nothing is playing.
+    SetPaused(bool),
+    /// Jumps to a position, kept within the video's length. Ignored when nothing is playing.
+    Seek {
+        position_secs: f64,
+    },
+    /// Ends playback, which takes the person back to the stream list.
+    StopPlayback,
+    /// What the player says about itself. Only the player sends this.
+    ReportPlayback(PlaybackReport),
 }
 
 /// Everything the UI draws. Replaced as a whole after every change.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct State {
     pub addons: Vec<InstalledAddon>,
     pub notice: Option<Notice>,
@@ -55,6 +73,8 @@ pub struct State {
     pub home: Vec<CatalogRow>,
     /// The title the person opened, until they close it.
     pub details: Option<Details>,
+    /// The stream being played, until it ends or the person stops it.
+    pub playback: Option<Playback>,
 }
 
 /// A title the person opened, and what its **addon** said about it.
@@ -94,6 +114,74 @@ pub struct StreamItem {
     pub playable: bool,
     /// Text for the person using the app, set when `playable` is false.
     pub unplayable_reason: Option<String>,
+}
+
+/// A stream being played: what it is, what the player should be doing, and what the player
+/// last said it is doing. The player makes itself match the middle part.
+#[derive(Clone, PartialEq)]
+pub struct Playback {
+    // What is playing.
+    pub meta_type: String,
+    pub meta_id: String,
+    pub video_id: String,
+    /// "Name", or for an episode "Name · S1E2 · Episode title".
+    pub title: String,
+    pub poster: Option<String>,
+    /// The id in the **addon**'s manifest.
+    pub addon_id: String,
+    pub stream_name: String,
+    pub filename: Option<String>,
+    /// The link to play. Only the player reads it. Never log it: later it can hold a
+    /// **debrid service** key.
+    pub url: String,
+
+    // What the player should be doing.
+    pub paused: bool,
+    /// The latest jump asked for. The player does it once for each new `id`.
+    pub seek: Option<SeekRequest>,
+
+    // What the player last said.
+    pub position_secs: f64,
+    /// Zero until the player knows it.
+    pub duration_secs: f64,
+    pub buffering: bool,
+}
+
+// By hand, so that no `{:?}` of the state, in a log or a failed test, can print the link.
+impl std::fmt::Debug for Playback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Playback")
+            .field("title", &self.title)
+            .field("video_id", &self.video_id)
+            .field("addon_id", &self.addon_id)
+            .field("stream_name", &self.stream_name)
+            .field("paused", &self.paused)
+            .field("seek", &self.seek)
+            .field("position_secs", &self.position_secs)
+            .field("duration_secs", &self.duration_secs)
+            .field("buffering", &self.buffering)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A jump to a position. `id` grows with every request, so the player can tell a new one from
+/// one it has already done.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeekRequest {
+    pub id: u64,
+    pub position_secs: f64,
+}
+
+/// What the player tells `Core` about itself, with [`Command::ReportPlayback`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaybackReport {
+    pub position_secs: f64,
+    pub duration_secs: f64,
+    pub buffering: bool,
+    /// The stream played to its end.
+    pub ended: bool,
+    /// The stream could not be played. The text is for the log, not for the person.
+    pub failed: Option<String>,
 }
 
 /// Something that is being fetched, or has been.

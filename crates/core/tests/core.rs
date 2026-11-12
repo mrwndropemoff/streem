@@ -1200,3 +1200,355 @@ async fn streams_for_an_earlier_episode_that_arrive_late_are_ignored() {
     let names: Vec<&str> = streams.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, ["Episode 2"]);
 }
+
+// ---- Playback -------------------------------------------------------------------------------
+
+use streem_core::{Playback, PlaybackReport};
+
+const FAILED_NOTICE: &str = "This stream could not be played. Pick another one.";
+
+/// A movie (`tt1`) and a series episode (`tt2:1:2`), each with one **addon** offering an
+/// unplayable torrent (index 0) and a playable direct link (index 1). Opens the title of
+/// `video_id` and loads its streams.
+async fn core_with_streams(
+    server: &MockServer,
+    dir: &Path,
+    video_id: &str,
+    on_change: impl Fn() + Send + Sync + 'static,
+) -> Core {
+    let meta = serve_meta_addon(server, "meta", r#""meta""#).await;
+    serve_json(
+        server,
+        "/meta/meta/series/tt2.json",
+        200,
+        r#"{"meta": {"id": "tt2", "type": "series", "name": "A Show", "poster": "http://x/p.jpg",
+            "videos": [{"id": "tt2:1:2", "title": "Second", "season": 1, "episode": 2}]}}"#,
+    )
+    .await;
+    serve_json(
+        server,
+        "/meta/meta/movie/tt1.json",
+        200,
+        r#"{"meta": {"id": "tt1", "type": "movie", "name": "A Film"}}"#,
+    )
+    .await;
+    let streams = serve_stream_addon(server, "one", r#""stream""#).await;
+    let body = r#"{"streams": [
+        {"name": "Torrent", "infoHash": "0123456789abcdef0123456789abcdef01234567"},
+        {"name": "Direct", "url": "https://cdn.example/files/Film.mkv"}]}"#;
+    serve_json(server, "/one/stream/movie/tt1.json", 200, body).await;
+    serve_json(server, "/one/stream/series/tt2:1:2.json", 200, body).await;
+
+    let core = Core::start_with_defaults(dir.to_path_buf(), on_change, Vec::new());
+    install(&core, meta, 1).await;
+    install(&core, streams, 2).await;
+    let (meta_type, meta_id) = match video_id {
+        "tt1" => ("movie", "tt1"),
+        _ => ("series", "tt2"),
+    };
+    open_title(&core, meta_type, meta_id).await;
+    load_streams(&core, video_id).await;
+    core
+}
+
+async fn core_ready_to_play(server: &MockServer, dir: &Path) -> Core {
+    core_with_streams(server, dir, "tt1", || {}).await
+}
+
+fn playback(state: &State) -> &Playback {
+    state
+        .playback
+        .as_ref()
+        .unwrap_or_else(|| panic!("nothing is playing: {state:?}"))
+}
+
+async fn play_direct(core: &Core) -> std::sync::Arc<State> {
+    core.send(Command::Play {
+        addon_id: "org.example.one".into(),
+        stream_index: 1,
+    });
+    wait_for(core, "playback started", |s| s.playback.is_some()).await
+}
+
+fn report(position_secs: f64, duration_secs: f64) -> PlaybackReport {
+    PlaybackReport {
+        position_secs,
+        duration_secs,
+        buffering: false,
+        ended: false,
+        failed: None,
+    }
+}
+
+/// Reports a duration, so that a later seek has a range to be clamped to.
+async fn report_duration(core: &Core, duration_secs: f64) {
+    core.send(Command::ReportPlayback(report(5.0, duration_secs)));
+    wait_for(core, "duration known", |s| {
+        s.playback
+            .as_ref()
+            .is_some_and(|p| p.duration_secs == duration_secs)
+    })
+    .await;
+}
+
+async fn wait_for_seek(core: &Core, position_secs: f64) -> std::sync::Arc<State> {
+    wait_for(core, "seek", |s| {
+        s.playback
+            .as_ref()
+            .and_then(|p| p.seek.as_ref())
+            .is_some_and(|seek| seek.position_secs == position_secs)
+    })
+    .await
+}
+
+#[tokio::test]
+async fn playing_a_playable_stream_starts_playback_with_its_link_and_what_is_playing() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_ready_to_play(&server, dir.path()).await;
+    assert!(core.state().playback.is_none());
+
+    let state = play_direct(&core).await;
+
+    let playback = playback(&state);
+    assert_eq!(playback.url, "https://cdn.example/files/Film.mkv");
+    assert!(!playback.paused);
+    assert_eq!(playback.seek, None);
+    assert_eq!(playback.meta_type, "movie");
+    assert_eq!(playback.meta_id, "tt1");
+    assert_eq!(playback.video_id, "tt1");
+    assert_eq!(playback.title, "A Film");
+    assert_eq!(playback.addon_id, "org.example.one");
+    assert_eq!(playback.stream_name, "Direct");
+    assert_eq!(playback.filename.as_deref(), Some("Film.mkv"));
+}
+
+#[tokio::test]
+async fn an_episode_is_titled_with_its_season_episode_and_title() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_with_streams(&server, dir.path(), "tt2:1:2", || {}).await;
+
+    let state = play_direct(&core).await;
+
+    let playback = playback(&state);
+    assert_eq!(playback.title, "A Show · S1E2 · Second");
+    assert_eq!(playback.video_id, "tt2:1:2");
+    assert_eq!(playback.poster.as_deref(), Some("http://x/p.jpg"));
+}
+
+#[tokio::test]
+async fn playing_an_unplayable_or_missing_stream_changes_nothing() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_ready_to_play(&server, dir.path()).await;
+    let before = core.state();
+
+    for (addon_id, stream_index) in [("org.example.one", 0), ("org.example.one", 9), ("nope", 1)] {
+        core.send(Command::Play {
+            addon_id: addon_id.into(),
+            stream_index,
+        });
+    }
+    // Commands are handled in order, so a start would show by the time this is handled.
+    core.send(Command::DismissNotice);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(*core.state(), *before);
+}
+
+#[tokio::test]
+async fn pausing_and_resuming_set_paused() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_ready_to_play(&server, dir.path()).await;
+    play_direct(&core).await;
+
+    core.send(Command::SetPaused(true));
+    wait_for(&core, "paused", |s| {
+        s.playback.as_ref().is_some_and(|p| p.paused)
+    })
+    .await;
+    core.send(Command::SetPaused(false));
+    wait_for(&core, "resumed", |s| {
+        s.playback.as_ref().is_some_and(|p| !p.paused)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn each_seek_gets_a_higher_id_and_shows_its_position_at_once() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_ready_to_play(&server, dir.path()).await;
+    play_direct(&core).await;
+    report_duration(&core, 100.0).await;
+
+    core.send(Command::Seek {
+        position_secs: 30.0,
+    });
+    let first = wait_for_seek(&core, 30.0).await;
+    core.send(Command::Seek {
+        position_secs: 40.0,
+    });
+    let second = wait_for_seek(&core, 40.0).await;
+
+    let first_id = playback(&first).seek.as_ref().unwrap().id;
+    let second_id = playback(&second).seek.as_ref().unwrap().id;
+    assert!(second_id > first_id, "{first_id} then {second_id}");
+    // The slider moves now, not when the player next reports.
+    assert_eq!(playback(&second).position_secs, 40.0);
+}
+
+#[tokio::test]
+async fn a_seek_beyond_the_duration_or_before_the_start_is_clamped() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_ready_to_play(&server, dir.path()).await;
+    play_direct(&core).await;
+    report_duration(&core, 100.0).await;
+
+    core.send(Command::Seek {
+        position_secs: 500.0,
+    });
+    wait_for_seek(&core, 100.0).await;
+
+    core.send(Command::Seek {
+        position_secs: -20.0,
+    });
+    wait_for_seek(&core, 0.0).await;
+}
+
+#[tokio::test]
+async fn a_report_fills_in_position_duration_and_buffering() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_ready_to_play(&server, dir.path()).await;
+    play_direct(&core).await;
+
+    core.send(Command::ReportPlayback(PlaybackReport {
+        buffering: true,
+        ..report(12.5, 90.0)
+    }));
+    let state = wait_for(&core, "report applied", |s| {
+        s.playback.as_ref().is_some_and(|p| p.buffering)
+    })
+    .await;
+
+    let playback = playback(&state);
+    assert_eq!(playback.position_secs, 12.5);
+    assert_eq!(playback.duration_secs, 90.0);
+}
+
+#[tokio::test]
+async fn an_ended_report_or_stopping_clears_playback() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_ready_to_play(&server, dir.path()).await;
+
+    play_direct(&core).await;
+    core.send(Command::ReportPlayback(PlaybackReport {
+        ended: true,
+        ..report(100.0, 100.0)
+    }));
+    let state = wait_for(&core, "playback cleared", |s| s.playback.is_none()).await;
+    assert!(state.notice.is_none());
+
+    play_direct(&core).await;
+    core.send(Command::StopPlayback);
+    let state = wait_for(&core, "playback cleared", |s| s.playback.is_none()).await;
+    assert!(state.notice.is_none());
+}
+
+#[tokio::test]
+async fn a_failed_report_clears_playback_and_raises_the_notice() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_ready_to_play(&server, dir.path()).await;
+    play_direct(&core).await;
+
+    core.send(Command::ReportPlayback(PlaybackReport {
+        failed: Some("loading failed".into()),
+        ..report(0.0, 0.0)
+    }));
+    let state = wait_for(&core, "playback cleared", |s| s.playback.is_none()).await;
+
+    assert_eq!(state.notice.as_ref().unwrap().text, FAILED_NOTICE);
+    // The title stays open, so the person is back at its stream list.
+    assert!(stream_list(&state).is_some());
+}
+
+#[tokio::test]
+async fn commands_and_reports_after_playback_ended_are_ignored() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_ready_to_play(&server, dir.path()).await;
+    play_direct(&core).await;
+    core.send(Command::StopPlayback);
+    wait_for(&core, "playback cleared", |s| s.playback.is_none()).await;
+
+    core.send(Command::ReportPlayback(PlaybackReport {
+        failed: Some("late".into()),
+        ..report(0.0, 0.0)
+    }));
+    core.send(Command::SetPaused(true));
+    core.send(Command::Seek { position_secs: 5.0 });
+    core.send(Command::StopPlayback);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let state = core.state();
+    assert!(state.playback.is_none());
+    assert!(state.notice.is_none());
+}
+
+#[tokio::test]
+async fn position_reports_publish_at_most_once_a_second() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let core = core_with_streams(&server, dir.path(), "tt1", move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+    })
+    .await;
+    play_direct(&core).await;
+    report_duration(&core, 100.0).await;
+
+    let before = calls.load(Ordering::SeqCst);
+    for step in 0..50 {
+        core.send(Command::ReportPlayback(report(
+            6.0 + f64::from(step) * 0.01,
+            100.0,
+        )));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let during = calls.load(Ordering::SeqCst) - before;
+
+    assert!(
+        during <= 1,
+        "on_change was called {during} times in about half a second"
+    );
+
+    // Held back is not lost: a position report a second later is published.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    core.send(Command::ReportPlayback(report(50.0, 100.0)));
+    wait_for(&core, "position published", |s| {
+        s.playback.as_ref().is_some_and(|p| p.position_secs == 50.0)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_link_never_shows_up_in_debug_output() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_ready_to_play(&server, dir.path()).await;
+
+    let state = play_direct(&core).await;
+
+    assert!(!format!("{state:?}").contains("cdn.example"));
+    assert!(!format!("{:?}", playback(&state)).contains("cdn.example"));
+}

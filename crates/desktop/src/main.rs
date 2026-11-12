@@ -1,12 +1,15 @@
 //! Streem desktop app. It draws what `streem-core` publishes and sends it commands.
 //! It does no network or disk work itself.
 
+mod mpv_view;
 mod screens;
 
 use std::path::PathBuf;
 
 use eframe::egui;
-use streem_core::{Command, Core};
+use streem_core::{Command, Core, PlaybackReport, State};
+
+use mpv_view::MpvView;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -22,18 +25,73 @@ struct App {
     home: screens::home::HomeScreen,
     addons: screens::addons::AddonsScreen,
     details: screens::details::DetailsScreen,
+    player: screens::player::PlayerScreen,
+    /// `None` when libmpv could not start. Browsing still works; playing a stream then fails.
+    video: Option<MpvView>,
+    /// `State.playback` was set in the last frame, so the player screen was showing.
+    was_playing: bool,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let egui_ctx = cc.egui_ctx.clone();
         let core = Core::start(data_dir(), move || egui_ctx.request_repaint());
+        let video = match MpvView::new(cc) {
+            Ok(video) => Some(video),
+            Err(error) => {
+                eprintln!("{error}");
+                None
+            }
+        };
         App {
             core,
             screen: Screen::Home,
             home: Default::default(),
             addons: Default::default(),
             details: Default::default(),
+            player: Default::default(),
+            video,
+            was_playing: false,
+        }
+    }
+
+    /// The player screen, shown in place of everything else while `State.playback` is set.
+    /// Playing and stopping are `Command`s; this only makes the video match the state.
+    fn play(&mut self, ui: &mut egui::Ui, state: &State) {
+        self.was_playing = true;
+        let Some(playback) = &state.playback else {
+            return;
+        };
+        let Some(video) = &mut self.video else {
+            self.core.send(Command::ReportPlayback(PlaybackReport {
+                position_secs: 0.0,
+                duration_secs: 0.0,
+                buffering: false,
+                ended: false,
+                failed: Some("libmpv is not available".into()),
+            }));
+            return;
+        };
+        video.sync(ui.ctx(), playback, &self.core);
+        let video = &*video;
+        self.player.ui(ui, state, &self.core, |ui, rect| {
+            video.paint(ui, rect);
+        });
+    }
+
+    /// Called every frame while nothing is playing. The first time after something was, it
+    /// unloads the file and leaves fullscreen, so the details screen is not stuck in it.
+    fn after_playback(&mut self, ctx: &egui::Context) {
+        if !self.was_playing {
+            return;
+        }
+        self.was_playing = false;
+        if let Some(video) = &mut self.video {
+            video.stop();
+        }
+        self.player.on_leave();
+        if ctx.input(|input| input.viewport().fullscreen.unwrap_or(false)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
     }
 
@@ -48,6 +106,11 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let state = self.core.state();
+        if state.playback.is_some() {
+            self.play(ui, &state);
+            return;
+        }
+        self.after_playback(&ui.ctx().clone());
         screens::notice_banner(ui, &state, &self.core);
         let before = self.screen;
         egui::Panel::top("navigation").show(ui, |ui| {
@@ -91,7 +154,7 @@ fn data_dir() -> PathBuf {
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        // The player (a later ticket) can only draw through OpenGL.
+        // The player can only draw through OpenGL.
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
