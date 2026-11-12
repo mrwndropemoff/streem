@@ -32,6 +32,13 @@ pub enum Command {
     /// Fetches the catalogs of the installed **addons** again. `Core` also does this by itself
     /// at startup and whenever the installed **addons** change.
     LoadHome,
+    /// Searches every catalog of the installed **addons** that supports search, all at once.
+    /// Replaces the results of any earlier search. An empty or whitespace-only query is the
+    /// same as [`Command::ClearSearch`].
+    Search {
+        query: String,
+    },
+    ClearSearch,
     /// Opens the details of a title. Asks the first installed **addon** that offers `meta`
     /// for this type and id.
     OpenTitle {
@@ -71,6 +78,8 @@ pub struct State {
     pub notice: Option<Notice>,
     /// One row for each catalog the installed **addons** offer, in **addon** order.
     pub home: Vec<CatalogRow>,
+    /// The latest search, until it is cleared.
+    pub search: Option<Search>,
     /// The title the person opened, until they close it.
     pub details: Option<Details>,
     /// The stream being played, until it ends or the person stops it.
@@ -193,13 +202,21 @@ pub enum Load<T> {
     Failed(String),
 }
 
-/// One catalog of one **addon**, shown on the home screen as a row of posters.
+/// One catalog of one **addon**, shown on the home or search screen as a row of posters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogRow {
     pub addon_name: String,
     pub catalog_name: String,
     pub meta_type: String,
     pub items: Load<Vec<MetaPreview>>,
+}
+
+/// The results of a search: one row for each catalog that supports search, in **addon** order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Search {
+    /// What was searched for, without surrounding whitespace.
+    pub query: String,
+    pub rows: Vec<CatalogRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

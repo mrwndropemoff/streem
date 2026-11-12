@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+
 use super::types::{Manifest, Meta, MetaPreview, Stream, Video};
 
 #[derive(Debug, thiserror::Error)]
@@ -71,12 +73,15 @@ pub async fn fetch_manifest(
 }
 
 /// The URL of a resource request: `{base}/{resource}/{type}/{id}.json`, where `{base}` is the
-/// manifest URL without `/manifest.json`. `{type}` and `{id}` are percent-encoded.
+/// manifest URL without `/manifest.json`. `{type}` and `{id}` are percent-encoded. An `extra`
+/// such as `("search", "the wire")` adds `/search=the%20wire` before `.json`; its value is
+/// percent-encoded so that `&`, `=` or `/` in it cannot be read as part of the request.
 fn resource_url(
     manifest_url: &str,
     resource: &str,
     meta_type: &str,
     id: &str,
+    extra: Option<(&str, &str)>,
 ) -> Result<String, AddonError> {
     let mut url = reqwest::Url::parse(manifest_url)
         .map_err(|_| AddonError::InvalidUrl(manifest_url.into()))?;
@@ -87,9 +92,30 @@ fn resource_url(
         .pop()
         .push(resource)
         .push(meta_type)
-        .push(&format!("{id}.json"));
-    Ok(url.into())
+        .push(id);
+    let mut url = String::from(url);
+    if let Some((name, value)) = extra {
+        url.push('/');
+        url.extend(utf8_percent_encode(name, EXTRA_VALUE));
+        url.push('=');
+        url.extend(utf8_percent_encode(value, EXTRA_VALUE));
+    }
+    url.push_str(".json");
+    Ok(url)
 }
+
+/// What stays unencoded in an extra: the characters JavaScript's `encodeURIComponent` leaves
+/// alone, which is what Stremio itself sends.
+const EXTRA_VALUE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'!')
+    .remove(b'~')
+    .remove(b'*')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')');
 
 /// The URL of a catalog: `{base}/catalog/{type}/{id}.json`.
 pub fn catalog_url(
@@ -97,7 +123,19 @@ pub fn catalog_url(
     meta_type: &str,
     catalog_id: &str,
 ) -> Result<String, AddonError> {
-    resource_url(manifest_url, "catalog", meta_type, catalog_id)
+    resource_url(manifest_url, "catalog", meta_type, catalog_id, None)
+}
+
+/// The URL of a search in a catalog: `{base}/catalog/{type}/{id}/search={query}.json`, with the
+/// query percent-encoded.
+pub fn search_url(
+    manifest_url: &str,
+    meta_type: &str,
+    catalog_id: &str,
+    query: &str,
+) -> Result<String, AddonError> {
+    let extra = Some(("search", query));
+    resource_url(manifest_url, "catalog", meta_type, catalog_id, extra)
 }
 
 /// Downloads the first page of a catalog. An entry that lacks an id, type or name is skipped,
@@ -128,7 +166,7 @@ pub async fn fetch_catalog(
 
 /// The URL of a meta request: `{base}/meta/{type}/{id}.json`.
 pub fn meta_url(manifest_url: &str, meta_type: &str, meta_id: &str) -> Result<String, AddonError> {
-    resource_url(manifest_url, "meta", meta_type, meta_id)
+    resource_url(manifest_url, "meta", meta_type, meta_id, None)
 }
 
 /// The URL of a stream request: `{base}/stream/{type}/{videoId}.json`. For a movie the video
@@ -138,7 +176,7 @@ pub fn stream_url(
     meta_type: &str,
     video_id: &str,
 ) -> Result<String, AddonError> {
-    resource_url(manifest_url, "stream", meta_type, video_id)
+    resource_url(manifest_url, "stream", meta_type, video_id, None)
 }
 
 /// Downloads the streams an **addon** offers for one video. An entry that is not an object is
@@ -206,6 +244,33 @@ pub async fn fetch_meta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_search_query_is_percent_encoded() {
+        let base = "https://example.com/a/manifest.json";
+        assert_eq!(
+            search_url(base, "movie", "top", "the wire").unwrap(),
+            "https://example.com/a/catalog/movie/top/search=the%20wire.json"
+        );
+        assert_eq!(
+            search_url(base, "movie", "top", "fast & furious 50%/+=?#é").unwrap(),
+            "https://example.com/a/catalog/movie/top/\
+             search=fast%20%26%20furious%2050%25%2F%2B%3D%3F%23%C3%A9.json"
+        );
+    }
+
+    #[test]
+    fn other_requests_keep_their_shape() {
+        let base = "https://example.com/a/manifest.json?key=1";
+        assert_eq!(
+            catalog_url(base, "movie", "top").unwrap(),
+            "https://example.com/a/catalog/movie/top.json"
+        );
+        assert_eq!(
+            stream_url(base, "series", "tt1:1:2").unwrap(),
+            "https://example.com/a/stream/series/tt1:1:2.json"
+        );
+    }
 
     #[test]
     fn stremio_scheme_becomes_https() {
