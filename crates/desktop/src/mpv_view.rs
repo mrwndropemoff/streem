@@ -38,8 +38,8 @@ pub struct Tracks {
     pub subtitles: Vec<Track>,
 }
 
-/// A subtitle from an **addon** to add to the file with this serial.
-struct AddSubtitle {
+/// A subtitle from an **addon** to add to the file with this generation.
+struct SubtitleJob {
     file: u64,
     url: String,
     lang: String,
@@ -74,8 +74,8 @@ pub struct MpvView {
     subtitles_added: usize,
     /// Grows with every load and stop, so the subtitle worker can drop what was meant for an
     /// earlier file.
-    file_serial: Arc<AtomicU64>,
-    subtitle_worker: mpsc::Sender<AddSubtitle>,
+    file_generation: Arc<AtomicU64>,
+    subtitle_worker: mpsc::Sender<SubtitleJob>,
 }
 
 impl MpvView {
@@ -120,8 +120,8 @@ impl MpvView {
         let repaint = cc.egui_ctx.clone();
         render.set_update_callback(move || repaint.request_repaint());
 
-        let file_serial = Arc::new(AtomicU64::new(0));
-        let subtitle_worker = spawn_subtitle_worker(mpv, file_serial.clone())?;
+        let file_generation = Arc::new(AtomicU64::new(0));
+        let subtitle_worker = spawn_subtitle_worker(mpv, file_generation.clone())?;
 
         Ok(MpvView {
             mpv,
@@ -132,7 +132,7 @@ impl MpvView {
             last_report: None,
             last_buffering: false,
             subtitles_added: 0,
-            file_serial,
+            file_generation,
             subtitle_worker,
         })
     }
@@ -305,7 +305,7 @@ impl MpvView {
         self.last_report = None;
         self.last_buffering = false;
         self.subtitles_added = 0;
-        self.file_serial.fetch_add(1, Ordering::SeqCst);
+        self.file_generation.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Hands the **addon** subtitles mpv does not have yet to the subtitle worker. Only once
@@ -314,9 +314,9 @@ impl MpvView {
         let Some(new) = playback.subtitles.get(self.subtitles_added..) else {
             return;
         };
-        let file = self.file_serial.load(Ordering::SeqCst);
+        let file = self.file_generation.load(Ordering::SeqCst);
         for track in new {
-            let _ = self.subtitle_worker.send(AddSubtitle {
+            let _ = self.subtitle_worker.send(SubtitleJob {
                 file,
                 url: track.url.clone(),
                 lang: track.lang.clone(),
@@ -377,14 +377,14 @@ impl MpvView {
 /// freeze the window. A subtitle meant for a file that is no longer loaded is dropped.
 fn spawn_subtitle_worker(
     mpv: &'static Mpv,
-    file_serial: Arc<AtomicU64>,
-) -> Result<mpsc::Sender<AddSubtitle>, String> {
-    let (sender, jobs) = mpsc::channel::<AddSubtitle>();
+    file_generation: Arc<AtomicU64>,
+) -> Result<mpsc::Sender<SubtitleJob>, String> {
+    let (sender, jobs) = mpsc::channel::<SubtitleJob>();
     std::thread::Builder::new()
         .name("mpv-subtitles".into())
         .spawn(move || {
             for job in jobs {
-                if job.file != file_serial.load(Ordering::SeqCst) {
+                if job.file != file_generation.load(Ordering::SeqCst) {
                     continue;
                 }
                 // `auto` adds it without selecting it. Its title and language are both the

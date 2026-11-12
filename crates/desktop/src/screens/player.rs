@@ -170,7 +170,7 @@ impl PlayerScreen {
         let tracks = video.tracks(&playback.subtitles);
 
         let audio = track_menu(ui, "audio-track", "Audio", &tracks.audio, None);
-        if let Some(Some(id)) = audio.picked {
+        if let Some(Pick::Track(id)) = audio.picked {
             video.select_audio(id);
         }
         let subtitles = track_menu(
@@ -180,8 +180,10 @@ impl PlayerScreen {
             &tracks.subtitles,
             Some("Off"),
         );
-        if let Some(choice) = subtitles.picked {
-            video.select_subtitle(choice);
+        match subtitles.picked {
+            Some(Pick::Off) => video.select_subtitle(None),
+            Some(Pick::Track(id)) => video.select_subtitle(Some(id)),
+            None => {}
         }
         self.menu_open = audio.open || subtitles.open;
     }
@@ -210,8 +212,15 @@ impl PlayerScreen {
 /// What a track menu did this frame.
 struct MenuOutcome {
     open: bool,
-    /// Something was picked: a track's id, or `None` for the "Off" entry.
-    picked: Option<Option<i64>>,
+    picked: Option<Pick>,
+}
+
+/// An entry of a track menu that was clicked.
+enum Pick {
+    /// The "Off" entry.
+    Off,
+    /// A track, by mpv's id.
+    Track(i64),
 }
 
 /// A menu of `tracks` whose button reads "`name`: selected track". With `off`, the first entry
@@ -237,11 +246,11 @@ fn track_menu(
             if let Some(off) = off
                 && ui.selectable_label(selected.is_none(), off).clicked()
             {
-                picked = Some(None);
+                picked = Some(Pick::Off);
             }
             for track in tracks {
                 if ui.selectable_label(track.selected, &track.label).clicked() {
-                    picked = Some(Some(track.id));
+                    picked = Some(Pick::Track(track.id));
                 }
             }
         });

@@ -68,7 +68,7 @@ pub(crate) enum Message {
     },
     /// One **addon** answered a subtitles request with these tracks. A failing **addon** sends
     /// nothing. Ignored when `generation` is not the latest one, which means another stream
-    /// started, or nothing is playing any more, since the request was made.
+    /// started since the request was made, and also when nothing is playing any more.
     Subtitles {
         generation: u64,
         tracks: Vec<SubtitleTrack>,
