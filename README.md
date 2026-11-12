@@ -2,7 +2,7 @@
 
 A Stremio-like media centre for family and friends. It installs **addons** (remote services that speak the Stremio addon protocol), browses their catalogs and plays their streams. Planned differences from Stremio: several **profiles** under one **account**, everything synced over the internet, and **watch parties**.
 
-> **Status: early development.** Today the desktop app has three screens: Home, which shows one row of posters for each catalog offered by your installed addons; Details, opened by clicking a poster, which shows a title's artwork, description, year, rating and genres (and, for a series, a season picker with its episodes), plus the streams your addons offer for the movie or the clicked episode, grouped by addon; and Addons, where you install an addon from a URL, list installed addons, and remove them. Playback, search, sync, profiles and watch parties are planned but not built yet (see [Roadmap](#roadmap)).
+> **Status: early development.** Today the desktop app has three screens: Home, which shows one row of posters for each catalog offered by your installed addons; Details, opened by clicking a poster, which shows a title's artwork, description, year, rating and genres (and, for a series, a season picker with its episodes), plus the streams your addons offer for the movie or the clicked episode, grouped by addon (click a playable stream to play it); a Player, which plays the stream inside the window with a control bar over the video; and Addons, where you install an addon from a URL, list installed addons, and remove them. Search, subtitles, sync, profiles and watch parties are planned but not built yet (see [Roadmap](#roadmap)).
 
 Target platforms: Linux (Wayland) and Windows. It is written entirely in Rust.
 
@@ -19,16 +19,28 @@ Target platforms: Linux (Wayland) and Windows. It is written entirely in Rust.
 
 ## What you need before running it
 
-The main app (`crates/core` + `crates/desktop`) needs only a Rust toolchain.
+The engine (`crates/core`) needs only a Rust toolchain. The window (`crates/desktop`) also needs **libmpv**, which plays the video.
 
 | Requirement | Why | How to get it |
 |---|---|---|
 | **Rust** (stable, with Cargo). The project uses the 2024 edition, so Rust 1.85 or newer. Developed with 1.99. | Builds everything | Install with [rustup](https://rustup.rs). Check with `cargo --version`. |
+| **libmpv** | `streem-desktop` links it and plays streams through it | **Linux:** your distro's libmpv development package (e.g. `libmpv-dev` on Debian/Ubuntu, `mpv` on Arch). **Windows:** see [libmpv on Windows](#libmpv-on-windows) below. |
 | **Windows only:** MSVC build tools | Rust on Windows links with Microsoft's linker | Install "Visual Studio Build Tools" with the *Desktop development with C++* workload. |
 | **Linux only:** a C compiler and a graphical session (Wayland or X11) with OpenGL | The bundled SQLite is compiled from C, and the window draws with OpenGL | e.g. `build-essential` on Debian/Ubuntu, `base-devel` on Arch. Your distro's Mesa/GPU drivers provide OpenGL. |
 | **Internet access** | The first launch installs the default addon (Cinemeta), installing any addon downloads its manifest, and the Home screen fetches catalogs and poster images | None needed. The tests run offline, apart from one opt-in test. |
 
-You do **not** need libmpv, ffmpeg, Supabase or a Real-Debrid account to run the app as it is today. Those only matter for features that are not built yet, or for the optional prototype below.
+You do **not** need ffmpeg, Supabase or a Real-Debrid account to run the app as it is today. Those only matter for features that are not built yet, or for the optional prototype below.
+
+### libmpv on Windows
+
+1. Download the `mpv-dev-x86_64` archive from the Windows builds linked on [mpv.io](https://mpv.io) and extract it, for example to `C:\libmpv`.
+2. From an "x64 Native Tools" prompt in that folder, make an MSVC import library: `lib /def:mpv.def /machine:x64 /out:mpv.lib`.
+3. Tell the linker where it is, in `%USERPROFILE%\.cargo\config.toml`:
+   ```toml
+   [target.x86_64-pc-windows-msvc]
+   rustflags = ["-L", "native=C:\\libmpv"]
+   ```
+4. After `cargo build`, copy `libmpv-2.dll` next to the program: `target\debug\` (or `target\release\`). Without it, `streem-desktop.exe` and the `streem-desktop` test program do not start.
 
 ## Run it
 
@@ -75,7 +87,7 @@ This is also a handy way to get a clean first launch: point it at an empty folde
 cargo test --workspace
 ```
 
-The tests live in `crates/core` and use a fake local web server (`wiremock`) and temporary folders, so they run offline and never touch your real data. They cover installing and removing addons, error notices, restarts (data survives), cancelling an install whose addon is removed mid-download, first-launch defaults, the Home catalog rows (loading, ready, one failing addon, catalogs that need extra input are left out), stream lists (one group per addon, loading on their own; which streams are playable and why not; filenames; a failing addon), and poster caching (one request per poster, none after a restart).
+The tests live in `crates/core` and use a fake local web server (`wiremock`) and temporary folders, so they run offline and never touch your real data. They cover installing and removing addons, error notices, restarts (data survives), cancelling an install whose addon is removed mid-download, first-launch defaults, the Home catalog rows (loading, ready, one failing addon, catalogs that need extra input are left out), stream lists (one group per addon, loading on their own; which streams are playable and why not; filenames; a failing addon), playback commands (play, pause, seek and its clamping, ended, failed, throttled position reports, and that the stream link never shows in debug output), and poster caching (one request per poster, none after a restart).
 
 One extra test downloads the real Cinemeta manifest from the internet and is skipped by default:
 
@@ -141,8 +153,9 @@ No UI code. Dependencies include `reqwest` (HTTP), `rusqlite` (bundled SQLite), 
 
 | File | What it does |
 |---|---|
-| `src/lib.rs` | The public face of the crate. Defines `Core` (the running engine), `Command` (what the UI can ask for: `InstallAddon`, `RemoveAddon`, `DismissNotice`, `LoadHome`, `OpenTitle`, `CloseTitle`, `LoadStreams`), `State` (everything the UI draws: the addon list, the Home catalog rows, the opened title's `Details` with its `StreamList`, and an optional notice) and `Notice` (a message for the user). `Core::poster` hands the UI a decoded poster once it is ready. `Core::start` launches the background thread and installs Cinemeta on first launch; dropping `Core` stops it cleanly, after saving pending work. |
+| `src/lib.rs` | The public face of the crate. Defines `Core` (the running engine), `Command` (what the UI can ask for: `InstallAddon`, `RemoveAddon`, `DismissNotice`, `LoadHome`, `OpenTitle`, `CloseTitle`, `LoadStreams`, `Play`, `SetPaused`, `Seek`, `StopPlayback`, `ReportPlayback`), `State` (everything the UI draws: the addon list, the Home catalog rows, the opened title's `Details` with its `StreamList`, the `Playback` of the stream being played, and an optional notice) and `Notice` (a message for the user). `Core::poster` hands the UI a decoded poster once it is ready. `Core::start` launches the background thread and installs Cinemeta on first launch; dropping `Core` stops it cleanly, after saving pending work. |
 | `src/app.rs` | The single background task that owns the mutable state. It receives commands and the results of its own network/disk jobs as messages, updates `State`, publishes it, and calls the UI's `on_change` callback. It never blocks on network or disk, and handles edge cases such as cancelling an install when the addon is removed mid-download. |
+| `src/playback.rs` | What is playing, as plain functions over `State`, with no player involved: `Play` turns a playable stream of the open title into a `Playback` (its link stays here, never in the stream list), `SetPaused` and `Seek` change what the player should do (a seek gets a new id and is kept within the video's length), and `ReportPlayback` copies back what the player says; an ended report clears the playback and a failed one also raises the notice "This stream could not be played. Pick another one." Nothing here logs, because a stream link can later hold a Real-Debrid key. |
 | `src/posters.rs` | Poster images. Downloads each image once, saves the original bytes under `<data folder>/posters/`, decodes and scales it to at most 300 pixels wide on a blocking task, and keeps the result in memory. A saved poster is never downloaded again, in this run or a later one. |
 | `src/store.rs` | Local SQLite storage in `streem.db`. Opens the file, runs numbered migrations (append new ones, never edit old ones), and saves, loads and removes addon rows. Columns such as `deleted`, `dirty` and `updated_at` are already there for the future sync feature. |
 | `src/addon/mod.rs` | Declares the `addon` module's two submodules. |
@@ -152,14 +165,16 @@ No UI code. Dependencies include `reqwest` (HTTP), `rusqlite` (bundled SQLite), 
 
 ### `crates/desktop` — the window (`streem-desktop`)
 
-Built with [egui](https://github.com/emilk/egui) through `eframe`, using the OpenGL (`glow`) renderer, because libmpv (the future video player) can only draw through OpenGL.
+Built with [egui](https://github.com/emilk/egui) through `eframe`, using the OpenGL (`glow`) renderer, because libmpv (the video player) can only draw through OpenGL.
 
 | File | What it does |
 |---|---|
-| `src/main.rs` | Program entry point. Opens the "Streem" window, starts `Core` (pointing it at the data folder, or `STREEM_DATA_DIR`), and each frame draws the notice banner, a Home/Addons top bar and the chosen screen (Home, Addons or Details) from the latest `State`. Opening a title from Home sends `OpenTitle` and shows Details; Back, or clicking a top-bar tab, sends `CloseTitle`. |
+| `src/main.rs` | Program entry point. Opens the "Streem" window, starts `Core` (pointing it at the data folder, or `STREEM_DATA_DIR`) and the video, and each frame draws either the Player (while `State.playback` is set) or the notice banner, a Home/Addons top bar and the chosen screen (Home, Addons or Details) from the latest `State`. Opening a title from Home sends `OpenTitle` and shows Details; Back, or clicking a top-bar tab, sends `CloseTitle`. When playback ends it unloads the file and leaves fullscreen. |
 | `src/screens/mod.rs` | Groups the screens and holds shared UI pieces, such as the dismissible red notice banner at the top of the window and `Textures`, which turns each poster or background image from `Core` into one egui texture and keeps it for later frames. |
 | `src/screens/home.rs` | The Home screen: a vertical list of catalog rows, each a title and a horizontal strip of posters with names. It asks `Core` for a poster only when its cell is on screen, draws a grey placeholder until it arrives, and returns the title the person clicked so `main.rs` can open it. Its scroll position is kept, so Back lands where you left. Loading rows show placeholders and failed rows show their message. |
-| `src/screens/details.rs` | The Details screen: a Back button, then the dimmed background image, poster, name, year, rating, genres and description of the opened title. For a series it adds a season dropdown (seasons ascending, season 0 last as "Specials") and that season's episodes as "E3 · Title". Below a movie, or beside the episodes once one is clicked, it lists the streams under each addon's name; streams the app cannot play (such as torrents) are greyed out with the reason, and clicking a playable one does nothing yet. Shows a placeholder while loading and the message if the request failed. |
+| `src/screens/details.rs` | The Details screen: a Back button, then the dimmed background image, poster, name, year, rating, genres and description of the opened title. For a series it adds a season dropdown (seasons ascending, season 0 last as "Specials") and that season's episodes as "E3 · Title". Below a movie, or beside the episodes once one is clicked, it lists the streams under each addon's name; streams the app cannot play (such as torrents) are greyed out with the reason, and clicking a playable one sends `Play`. Shows a placeholder while loading and the message if the request failed. |
+| `src/mpv_view.rs` | The one place that talks to libmpv. It owns the mpv instance and draws its video into egui's OpenGL context. Every frame it compares mpv with `State.playback` and corrects mpv (load a different link, pause or resume, do a seek it has not done yet), then sends `ReportPlayback` about once a second while playing, at once when buffering starts or stops, and when the file ends or cannot be loaded. |
+| `src/screens/player.rs` | The Player screen, shown in place of everything else while `State.playback` is set: the video fills the window, with a control bar over it (Back, Play/Pause, seek slider, time, title) that hides after 3 seconds without mouse movement. The controls only send `SetPaused`, `Seek` and `StopPlayback`. Keys: Space pauses, Left and Right seek 10 seconds, Escape stops, F toggles fullscreen. |
 | `src/screens/addons.rs` | The Addons screen: the URL field and **Install** button, the scrolling list of installed addons (name, version, description), and a **Remove** button on each. It only sends `Command`s; it never does I/O itself. |
 
 ### `prototypes/egui-mpv` — throwaway experiment
@@ -199,14 +214,14 @@ cargo run --release -- sample/sample.mkv
 | File | What it does |
 |---|---|
 | `spec.md` | The v1 specification: what the app is, key decisions, the two-crate rule, accounts/profiles/overrides, Real-Debrid via addons, sync, watch parties, build order and open risks. **Read this first** to understand where the project is going. |
-| `issues/01` … `issues/22` | One ticket per piece of work, each with a `Status:` line (e.g. `ready-for-agent`, `ready-for-human`). Tickets 01 to 06 have been worked on (their `Status:` lines may lag behind the code); the rest are the backlog. |
+| `issues/01` … `issues/22` | One ticket per piece of work, each with a `Status:` line (e.g. `ready-for-agent`, `ready-for-human`). Tickets 01 to 07 have been worked on (their `Status:` lines may lag behind the code); the rest are the backlog. |
 
 ## Roadmap
 
 From the spec, in build order (v1 is steps 1 to 5):
 
 1. **Prototype:** egui plays video through libmpv. *Done: egui was chosen.*
-2. **Browse and play:** workspace and addon install *(done)*, catalogs on the Home screen *(done)*, title details *(done)*, stream list *(done)*, then playback, search, subtitles. *In progress.*
+2. **Browse and play:** workspace and addon install *(done)*, catalogs on the Home screen *(done)*, title details *(done)*, stream list *(done)*, playing a stream *(done)*, then search, subtitles. *In progress.*
 3. **Real-Debrid:** a `{real_debrid_key}` placeholder in addon URLs (Real-Debrid itself is handled by addons such as Torrentio; the app has no torrent engine).
 4. **Account and profiles:** sign-up/sign-in, profile picker, per-profile overrides, history, continue-watching and library, all synced through Supabase.
 5. **Watch party:** shared play/pause/seek between profiles of one account.

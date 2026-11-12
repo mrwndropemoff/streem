@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -17,12 +18,16 @@ use crate::addon::client::{
 use crate::addon::types::{
     Manifest, ManifestCatalog, Meta, MetaPreview, Stream, StreamSource, is_http,
 };
+use crate::playback::{self, Links, Reported};
 use crate::posters::{self, Poster, PosterCache};
 use crate::store::{Store, StoreError, StoredAddon};
 use crate::{
     CatalogRow, Command, Details, InstalledAddon, Load, Notice, State, StreamGroup, StreamItem,
     StreamList,
 };
+
+/// Position-only reports from the player are published at most this often.
+const POSITION_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What the task receives: the UI's commands, and results of work it started.
 pub(crate) enum Message {
@@ -32,6 +37,9 @@ pub(crate) enum Message {
     Fetched(u64, Result<String, String>),
     /// A disk job finished. The error is text for a [`Notice`].
     Stored(Result<StoreOutput, String>),
+    /// A position held back by `POSITION_PUBLISH_INTERVAL` may now be published. Sent by the
+    /// task's own timer, not by the UI.
+    PublishHeldBack,
     /// The UI asked for a poster it has not asked for before.
     LoadPoster(String),
     /// A poster finished loading, or could not be.
@@ -123,17 +131,31 @@ impl App {
         // stream request the running fetches belong to.
         let mut stream_addon_urls: Vec<String> = Vec::new();
         let mut streams_generation = 0;
+        // The links of the streams in those groups. The UI never sees them.
+        let mut stream_links: Links = Vec::new();
+        // When a report from the player was last published, for `POSITION_PUBLISH_INTERVAL`.
+        let mut last_report_published: Option<Instant> = None;
+        // When a held-back position must be published, if the player sends nothing before then.
+        let mut held_back_until: Option<Instant> = None;
 
         loop {
+            // The future is built even when the branch is off, so it needs some instant.
+            let deadline = held_back_until.unwrap_or_else(Instant::now);
             let message = tokio::select! {
                 message = self.inbox.recv() => message,
+                () = tokio::time::sleep_until(deadline.into()), if held_back_until.is_some() => {
+                    Some(Message::PublishHeldBack)
+                }
                 _ = &mut self.shutdown => None,
             };
             let Some(message) = message else { break };
 
             let mut to_install = Vec::new();
             let mut reload_home = false;
+            // Set when the state changed only by a position nobody needs to hear about yet.
+            let mut hold_back = false;
             match message {
+                Message::PublishHeldBack => last_report_published = Some(Instant::now()),
                 Message::Command(Command::InstallAddon { url }) => to_install.push(url),
                 Message::Command(Command::LoadHome) => reload_home = true,
                 Message::LoadPoster(url) => {
@@ -162,6 +184,7 @@ impl App {
                     details_generation += 1;
                     streams_generation += 1;
                     stream_addon_urls.clear();
+                    stream_links.clear();
                     let meta = start_meta(
                         &client,
                         &self.sender,
@@ -181,7 +204,9 @@ impl App {
                     details_generation += 1;
                     streams_generation += 1;
                     stream_addon_urls.clear();
+                    stream_links.clear();
                     state.details = None;
+                    playback::stop(&mut state);
                 }
                 Message::Command(Command::LoadStreams { video_id }) => {
                     if let Some(details) = state.details.as_mut() {
@@ -195,7 +220,40 @@ impl App {
                             streams_generation,
                         );
                         stream_addon_urls = sources;
+                        stream_links = list.groups.iter().map(|_| Vec::new()).collect();
                         details.streams = Some(list);
+                    }
+                }
+                Message::Command(Command::Play {
+                    addon_id,
+                    stream_index,
+                }) => playback::play(&mut state, &stream_links, &addon_id, stream_index),
+                Message::Command(Command::SetPaused(paused)) => {
+                    playback::set_paused(&mut state, paused);
+                }
+                Message::Command(Command::Seek { position_secs }) => {
+                    playback::seek(&mut state, position_secs);
+                }
+                Message::Command(Command::StopPlayback) => playback::stop(&mut state),
+                Message::Command(Command::ReportPlayback(report)) => {
+                    match playback::report(&mut state, report) {
+                        Reported::Ignored => {}
+                        Reported::Failed => {
+                            let text = playback::FAILED_NOTICE.to_string();
+                            state.notice = Some(notice(&mut next_notice_id, text));
+                            last_report_published = Some(Instant::now());
+                        }
+                        Reported::Changed => last_report_published = Some(Instant::now()),
+                        Reported::PositionOnly => {
+                            let recent = last_report_published
+                                .filter(|at| at.elapsed() < POSITION_PUBLISH_INTERVAL);
+                            if let Some(at) = recent {
+                                hold_back = true;
+                                held_back_until = Some(at + POSITION_PUBLISH_INTERVAL);
+                            } else {
+                                last_report_published = Some(Instant::now());
+                            }
+                        }
                     }
                 }
                 Message::Streams {
@@ -215,8 +273,10 @@ impl App {
                             Ok(streams) if streams.is_empty() => {
                                 list.groups.remove(index);
                                 stream_addon_urls.remove(index);
+                                stream_links.remove(index);
                             }
                             Ok(streams) => {
+                                stream_links[index] = streams.iter().map(stream_link).collect();
                                 list.groups[index].streams =
                                     Load::Ready(streams.into_iter().map(stream_item).collect());
                             }
@@ -286,7 +346,11 @@ impl App {
                     }
                 }
             }
-            if *published != state {
+            if !hold_back {
+                // Whatever was held back goes out now with the rest of the state.
+                held_back_until = None;
+            }
+            if !hold_back && *published != state {
                 published = Arc::new(state.clone());
                 *self
                     .state
@@ -458,6 +522,15 @@ fn start_streams(
         });
     }
     (sources, StreamList { video_id, groups })
+}
+
+/// The link to play a stream from, kept inside `Core`. Only `http://` and `https://` links can
+/// be played, which is also what [`stream_item`] reports as `playable`.
+fn stream_link(stream: &Stream) -> Option<String> {
+    match &stream.source {
+        StreamSource::Url(url) if is_http(url) => Some(url.clone()),
+        _ => None,
+    }
 }
 
 /// What the UI is told about a stream. Only `http://` and `https://` links can be played.
