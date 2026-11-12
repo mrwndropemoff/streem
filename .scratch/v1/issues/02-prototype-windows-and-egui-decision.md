@@ -36,10 +36,10 @@ It needs a Windows machine and someone looking at the video.
 
 ## Acceptance checks
 
-- [ ] Every "Human check" box in ticket 01 is ticked for Linux.
-- [ ] The same list passes on Windows, or the failure is written down.
-- [ ] Either `docs/adr/0002-egui-for-the-desktop-ui.md` exists, or a Slint prototype ticket exists.
-- [ ] The Windows build steps are written under `## Comments`.
+- [x] Every "Human check" box in ticket 01 is ticked for Linux.
+- [x] The same list passes on Windows, or the failure is written down.
+- [x] Either `docs/adr/0002-egui-for-the-desktop-ui.md` exists, or a Slint prototype ticket exists.
+- [x] The Windows build steps are written under `## Comments`.
 
 ## Comments
 **Agent prep notes (2026-11-12). Unverified: nothing here was run on Windows. No box above is ticked.**
@@ -51,7 +51,7 @@ It needs a Windows machine and someone looking at the video.
 
 ---
 
-**Agent run on Windows 11 (2026-11-12). Build and headless run verified; the video was not looked at. No box above is ticked and `docs/adr/0002-egui-for-the-desktop-ui.md` is not written, because both depend on the human check below.**
+**Outcome A (2026-11-12): both systems pass.** The agent verified the build and a headless run on Windows 11; the human then ran the check list below and all six items passed. `docs/adr/0002-egui-for-the-desktop-ui.md` is written. Tickets 03 onward can start on egui.
 
 ### What I verified on this machine
 
@@ -76,20 +76,18 @@ It needs a Windows machine and someone looking at the video.
 - `libmpv-2.dll` is copied by hand into `target\release\` (the DLL name in the archive matches the ticket).
 - `lib.exe` and `link.exe` are not on the plain PowerShell PATH, so `mpv.lib` must have been made from a VS developer prompt.
 
-### Still needed from a human (Windows)
+### Human check on Windows (passed)
 
-Run the same list as ticket 01 on Windows and note anything that differs:
+- [x] Video is inside the window, not a second window.
+- [x] Control bar drawn over the video and usable.
+- [x] Play/Pause button and seek slider work.
+- [x] Audio track switch changes the tone (`eng` and `fra` sine tones); subtitle switch shows and hides text.
+- [x] Resize and fullscreen (`F`) keep the picture correct.
+- [x] CPU near zero while paused (Task Manager).
 
-- [ ] Video is inside the window, not a second window.
-- [ ] Control bar drawn over the video and usable.
-- [ ] Play/Pause button and seek slider work.
-- [ ] Audio track switch changes the tone (`eng` and `fra` sine tones); subtitle switch shows and hides text.
-- [ ] Resize and fullscreen (`F`) keep the picture correct.
-- [ ] CPU near zero while paused (Task Manager).
+### Windows setup steps for ticket 07
 
-If all pass, either tell me or tick them here, and the ADR from Outcome A can be written. If one fails, record it here (Outcome B).
-
-### Windows setup steps for ticket 07 (draft: promote after the human check passes)
+These are the steps behind the build that passed. The `mpv.lib` step (3) is inferred from the files in `C:\libmpv`, not watched.
 
 1. `rustup` with the default MSVC toolchain; Visual Studio Build Tools with the C++ workload (needed for `link.exe`, `lib.exe`).
 2. Download `mpv-dev-x86_64` from the Windows builds linked on mpv.io; extract to `C:\libmpv` (`libmpv-2.dll`, `libmpv.dll.a`, `mpv.def`, `include\`).
