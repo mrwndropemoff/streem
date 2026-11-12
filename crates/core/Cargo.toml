@@ -1,0 +1,17 @@
+[package]
+name = "streem-core"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+rusqlite = { version = "0.42.0", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+wiremock = "0.6.5"
