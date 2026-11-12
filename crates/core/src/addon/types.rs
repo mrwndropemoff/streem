@@ -97,6 +97,19 @@ impl ManifestCatalog {
             .iter()
             .any(|extra| extra.is_required == Some(true))
     }
+
+    /// A catalog can be searched when it declares the `search` extra and needs no other extra.
+    pub fn supports_search(&self) -> bool {
+        let mut search = false;
+        for extra in &self.extra {
+            if extra.name == "search" {
+                search = true;
+            } else if extra.is_required == Some(true) {
+                return false;
+            }
+        }
+        search
+    }
 }
 
 /// An `extra` entry of a catalog, such as `skip`, `genre` or `search`.

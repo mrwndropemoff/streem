@@ -674,7 +674,7 @@ fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
             if !catalog.has_required_extra() {
                 catalogs.push(source());
             }
-            if supports_search(catalog) {
+            if catalog.supports_search() {
                 search_catalogs.push(source());
             }
         }
@@ -688,19 +688,6 @@ fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
         manifests,
         first_launch,
     })
-}
-
-/// A catalog can be searched when it declares the `search` extra and needs no other extra.
-fn supports_search(catalog: &ManifestCatalog) -> bool {
-    let mut search = false;
-    for extra in &catalog.extra {
-        if extra.name == "search" {
-            search = true;
-        } else if extra.is_required == Some(true) {
-            return false;
-        }
-    }
-    search
 }
 
 /// A saved row whose manifest can no longer be read is left out of the list.

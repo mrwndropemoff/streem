@@ -1814,6 +1814,57 @@ async fn clear_search_removes_the_results() {
     wait_for(&core, "search cleared", |s| s.search.is_none()).await;
 }
 
+#[tokio::test]
+async fn results_arriving_after_clear_search_never_appear() {
+    let server = MockServer::start().await;
+    let url = serve_addon(
+        &server,
+        "one",
+        r#"[{"type": "movie", "id": "find", "name": "Movies", "extra": [{"name": "search"}]}]"#,
+    )
+    .await;
+    serve_json(
+        &server,
+        "/one/catalog/movie/find.json",
+        200,
+        r#"{"metas": []}"#,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/one/catalog/movie/find/search=late.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"metas": [{"id": "tt1", "type": "movie", "name": "Late"}]}"#)
+                .set_delay(Duration::from_millis(400)),
+        )
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    install(&core, url, 1).await;
+
+    core.send(Command::Search {
+        query: "late".into(),
+    });
+    wait_for(&core, "search started", |s| s.search.is_some()).await;
+    core.send(Command::ClearSearch);
+    wait_for(&core, "search cleared", |s| s.search.is_none()).await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    assert!(core.state().search.is_none());
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/one/catalog/movie/find/search=late.json")
+            .count(),
+        1,
+        "the late search request was sent"
+    );
+}
+
 /// Needs internet access: `cargo test -p streem-core -- --ignored`.
 #[tokio::test]
 #[ignore]
