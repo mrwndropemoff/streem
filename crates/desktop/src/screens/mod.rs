@@ -1,4 +1,5 @@
 pub mod addons;
+pub mod home;
 
 use eframe::egui;
 use streem_core::{Command, Core, State};

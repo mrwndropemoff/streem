@@ -56,6 +56,44 @@ pub struct ManifestCatalog {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub extra: Vec<ManifestExtra>,
+}
+
+impl ManifestCatalog {
+    /// What the home screen shows: the catalog's name, or its id when it has none.
+    pub fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.id)
+    }
+
+    /// The home screen can only show a catalog that can be requested with no extra properties.
+    pub fn has_required_extra(&self) -> bool {
+        self.extra
+            .iter()
+            .any(|extra| extra.is_required == Some(true))
+    }
+}
+
+/// An `extra` entry of a catalog, such as `skip`, `genre` or `search`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestExtra {
+    /// Lenient on purpose: an odd `extra` entry must not make the whole manifest unreadable.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub is_required: Option<bool>,
+}
+
+/// One entry of a catalog response: enough to draw a poster.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MetaPreview {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub meta_type: String,
+    pub name: String,
+    #[serde(default)]
+    pub poster: Option<String>,
 }
 
 #[cfg(test)]
@@ -93,6 +131,27 @@ mod tests {
         assert!(manifest.description.is_none());
         assert!(manifest.catalogs.is_empty());
         assert!(manifest.id_prefixes.is_none());
+    }
+
+    #[test]
+    fn catalog_extras_decide_whether_it_can_be_listed() {
+        let json = r#"[
+            {"type": "movie", "id": "top", "extra": [{"name": "skip"}, {"name": "genre", "options": ["A"]}]},
+            {"type": "movie", "id": "search", "name": "Search", "extra": [{"name": "search", "isRequired": true}]}
+        ]"#;
+        let catalogs: Vec<ManifestCatalog> = serde_json::from_str(json).unwrap();
+        assert!(!catalogs[0].has_required_extra());
+        assert_eq!(catalogs[0].display_name(), "top");
+        assert!(catalogs[1].has_required_extra());
+        assert_eq!(catalogs[1].display_name(), "Search");
+    }
+
+    #[test]
+    fn an_odd_extra_entry_does_not_break_the_manifest() {
+        let json = r#"{"id":"a","version":"0.1.0","name":"A","types":[],"resources":[],
+            "catalogs":[{"type":"movie","id":"top","extra":[{"isRequired":null},{"name":"skip"}]}]}"#;
+        let manifest: Manifest = serde_json::from_str(json).unwrap();
+        assert!(!manifest.catalogs[0].has_required_extra());
     }
 
     #[test]

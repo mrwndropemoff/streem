@@ -3,6 +3,7 @@
 
 pub mod addon;
 mod app;
+mod posters;
 mod store;
 
 use std::path::PathBuf;
@@ -11,15 +12,25 @@ use std::thread::JoinHandle;
 
 use tokio::sync::{mpsc, oneshot};
 
+pub use addon::types::MetaPreview;
+pub use posters::Poster;
+
 /// Installed on first launch.
 const CINEMETA_URL: &str = "https://v3-cinemeta.strem.io/manifest.json";
 
 /// A request from the UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    InstallAddon { url: String },
-    RemoveAddon { url: String },
+    InstallAddon {
+        url: String,
+    },
+    RemoveAddon {
+        url: String,
+    },
     DismissNotice,
+    /// Fetches the catalogs of the installed **addons** again. `Core` also does this by itself
+    /// at startup and whenever the installed **addons** change.
+    LoadHome,
 }
 
 /// Everything the UI draws. Replaced as a whole after every change.
@@ -27,6 +38,26 @@ pub enum Command {
 pub struct State {
     pub addons: Vec<InstalledAddon>,
     pub notice: Option<Notice>,
+    /// One row for each catalog the installed **addons** offer, in **addon** order.
+    pub home: Vec<CatalogRow>,
+}
+
+/// Something that is being fetched, or has been.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Load<T> {
+    Loading,
+    Ready(T),
+    /// Text for the person using the app.
+    Failed(String),
+}
+
+/// One catalog of one **addon**, shown on the home screen as a row of posters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogRow {
+    pub addon_name: String,
+    pub catalog_name: String,
+    pub meta_type: String,
+    pub items: Load<Vec<MetaPreview>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +80,7 @@ pub struct Notice {
 pub struct Core {
     commands: mpsc::UnboundedSender<app::Message>,
     state: Arc<RwLock<Arc<State>>>,
+    posters: Arc<posters::PosterCache>,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -69,12 +101,14 @@ impl Core {
         let state = Arc::new(RwLock::new(Arc::new(State::default())));
         let (commands, inbox) = mpsc::unbounded_channel();
         let (shutdown, shutdown_signal) = oneshot::channel();
+        let posters = Arc::new(posters::PosterCache::default());
 
         let app = app::App {
             data_dir,
             on_change: Arc::new(on_change),
             default_addon_urls,
             state: state.clone(),
+            posters: posters.clone(),
             sender: commands.clone(),
             inbox,
             shutdown: shutdown_signal,
@@ -94,6 +128,7 @@ impl Core {
         Core {
             commands,
             state,
+            posters,
             shutdown: Some(shutdown),
             thread: Some(thread),
         }
@@ -103,6 +138,19 @@ impl Core {
     pub fn send(&self, command: Command) {
         // Fails only when the background thread has already stopped.
         let _ = self.commands.send(app::Message::Command(command));
+    }
+
+    /// Returns the decoded poster if it is ready. On the first call for a URL it starts
+    /// loading in the background and returns `None`; `on_change` fires when it is ready.
+    /// Never waits on the network or the disk.
+    pub fn poster(&self, url: &str) -> Option<Arc<Poster>> {
+        let (poster, start_loading) = self.posters.lookup(url);
+        if start_loading {
+            let _ = self
+                .commands
+                .send(app::Message::LoadPoster(url.to_string()));
+        }
+        poster
     }
 
     /// The latest published state. Never waits on the network or the disk.
