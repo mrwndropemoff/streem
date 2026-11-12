@@ -50,12 +50,13 @@ impl ManifestResource {
 }
 
 impl Manifest {
-    /// True when this **addon** can answer a meta request for the type and id: it lists the
-    /// `meta` resource, and the type and the start of the id are within its limits. A resource
-    /// given as an object carries its own limits; a plain name uses the manifest's.
-    pub fn offers_meta(&self, meta_type: &str, meta_id: &str) -> bool {
+    /// True when this **addon** can answer a request for `resource` (such as `meta` or
+    /// `stream`) with this type and id: it lists the resource, and the type and the start of
+    /// the id are within its limits. A resource given as an object carries its own limits; a
+    /// plain name uses the manifest's.
+    pub fn offers(&self, resource_name: &str, meta_type: &str, id: &str) -> bool {
         self.resources.iter().any(|resource| {
-            if resource.name() != "meta" {
+            if resource.name() != resource_name {
                 return false;
             }
             let (types, id_prefixes) = match resource {
@@ -67,9 +68,8 @@ impl Manifest {
             let types = types.unwrap_or(&self.types);
             let id_prefixes = id_prefixes.or(self.id_prefixes.as_ref());
             types.iter().any(|offered| offered == meta_type)
-                && id_prefixes.is_none_or(|prefixes| {
-                    prefixes.iter().any(|prefix| meta_id.starts_with(prefix))
-                })
+                && id_prefixes
+                    .is_none_or(|prefixes| prefixes.iter().any(|prefix| id.starts_with(prefix)))
         })
     }
 }
@@ -190,6 +190,100 @@ impl From<RawVideo> for Video {
             released: raw.released,
         }
     }
+}
+
+/// One entry of a stream response: something an **addon** offers to play for one video.
+///
+/// Read leniently like [`Video`]: an entry is only skipped when it is not a JSON object.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(from = "RawStream")]
+pub struct Stream {
+    pub name: String,
+    /// Called `title` by older **addons**.
+    pub description: String,
+    /// `behaviorHints.filename`, or else the last part of the URL when it looks like a file.
+    pub filename: Option<String>,
+    pub source: StreamSource,
+}
+
+/// Where a [`Stream`] is played from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamSource {
+    /// A link, of any scheme.
+    Url(String),
+    /// A torrent, which the app does not play: it has no torrent engine.
+    Torrent,
+    /// Anything else, such as `ytId` or `externalUrl`.
+    Other,
+}
+
+/// The wire shape of a [`Stream`].
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawStream {
+    #[serde(default, deserialize_with = "text_or_number")]
+    name: Option<String>,
+    #[serde(default, deserialize_with = "text_or_number")]
+    description: Option<String>,
+    #[serde(default, deserialize_with = "text_or_number")]
+    title: Option<String>,
+    #[serde(default, deserialize_with = "text_or_number")]
+    url: Option<String>,
+    #[serde(default, deserialize_with = "text_or_number")]
+    info_hash: Option<String>,
+    #[serde(default)]
+    behavior_hints: Option<serde_json::Value>,
+}
+
+impl From<RawStream> for Stream {
+    fn from(raw: RawStream) -> Self {
+        let hinted_filename = raw
+            .behavior_hints
+            .as_ref()
+            .and_then(|hints| hints.get("filename"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let filename = hinted_filename.or_else(|| raw.url.as_deref().and_then(filename_in_url));
+        // An `infoHash` makes it a torrent, even next to a `magnet:` link, unless the
+        // **addon** also gives an `http(s)` link that can be played instead.
+        let source = match (raw.url, raw.info_hash) {
+            (Some(url), _) if is_http(&url) => StreamSource::Url(url),
+            (_, Some(_)) => StreamSource::Torrent,
+            (Some(url), None) => StreamSource::Url(url),
+            (None, None) => StreamSource::Other,
+        };
+        Stream {
+            name: raw.name.unwrap_or_default(),
+            description: raw.description.or(raw.title).unwrap_or_default(),
+            filename,
+            source,
+        }
+    }
+}
+
+/// The last segment of the URL's path, percent-decoded, when it has a file extension
+/// (`My%20Film.mkv` gives `My Film.mkv`). The query string is not part of it.
+///
+/// The extension is read before decoding, so an encoded `?` or `#` cannot end up in it, and it
+/// must be letters and digits with at least one letter, so `v1.2` is not a file.
+fn filename_in_url(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let last = parsed.path_segments()?.next_back()?;
+    let (stem, extension) = last.rsplit_once('.')?;
+    let is_extension = extension.chars().all(|c| c.is_ascii_alphanumeric())
+        && extension.chars().any(|c| c.is_ascii_alphabetic());
+    if stem.is_empty() || !is_extension {
+        return None;
+    }
+    let decoded = percent_encoding::percent_decode_str(last)
+        .decode_utf8()
+        .ok()?;
+    Some(decoded.into_owned())
+}
+
+/// Only `http://` and `https://` links can be played.
+pub(crate) fn is_http(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
 }
 
 fn text_or_number<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>

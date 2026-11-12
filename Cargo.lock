@@ -3068,6 +3068,7 @@ name = "streem-core"
 version = "0.0.0"
 dependencies = [
  "image",
+ "percent-encoding",
  "reqwest",
  "rusqlite",
  "serde",

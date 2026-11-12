@@ -71,7 +71,7 @@ Playback, Real-Debrid, sorting or filtering streams.
 
 ## Acceptance checks
 
-- [ ] `cargo test -p streem-core` passes, including tests against a `wiremock` server that: two **addons** give two groups that load independently; a stream with `url` is playable; a stream with only `infoHash` is unplayable with the torrent reason; `filename` comes from `behaviorHints.filename`, and from the URL's last segment when the hint is absent; an **addon** without the `stream` resource is not asked; a failing **addon** yields a `Failed` group and leaves the others intact.
+- [x] `cargo test -p streem-core` passes, including tests against a `wiremock` server that: two **addons** give two groups that load independently; a stream with `url` is playable; a stream with only `infoHash` is unplayable with the torrent reason; `filename` comes from `behaviorHints.filename`, and from the URL's last segment when the hint is absent; an **addon** without the `stream` resource is not asked; a failing **addon** yields a `Failed` group and leaves the others intact.
 - [ ] `cargo run -p streem-desktop` with a stream **addon** installed: a movie shows its stream list; a series shows it after an episode click.
 
 ## Rules
@@ -85,3 +85,13 @@ Playback, Real-Debrid, sorting or filtering streams.
 - When done, tick the boxes and add a line under `## Comments` saying what you verified and how.
 
 ## Comments
+- Core: `cargo test --workspace` passes, with four new wiremock tests in `crates/core/tests/core.rs`:
+  - two **addons** load as independent groups (one `Ready` while the other is still `Loading`; an **addon** with no streams is dropped)
+  - playability, reasons and filenames (from `behaviorHints.filename`, and from a percent-encoded URL segment with a query string)
+  - an **addon** without `stream` is not asked
+  - a failing **addon** gives a `Failed` group while the other stays `Ready`
+
+  `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings` are clean.
+- Desktop: `cargo run -p streem-desktop` starts and runs 25 seconds with no panic. The click-through check (a movie lists its streams; a series lists them after an episode click, with a stream **addon** installed) was **not** done by the agent and still needs a human.
+- `crates/desktop/src/main.rs` got one line outside the Files list. Leaving the details screen resets its "movie streams asked" flag, so reopening the same movie asks for its streams again.
+- After a two-axis review: a stream with an `infoHash` now gets the torrent reason even when its `url` is a `magnet:` link (an `http(s)` `url` still wins and is playable), and a URL's file extension is read before percent-decoding and must contain a letter, so `a.mkv%3Fx` and `v1.2` give no `filename`. Four new wiremock tests in `crates/core/tests/core.rs` cover these two cases, an **addon** skipped for its `types` or `idPrefixes`, and a late answer for an earlier episode being ignored. `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` pass.
