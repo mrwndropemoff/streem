@@ -131,6 +131,29 @@ async fn removes_an_addon() {
 }
 
 #[tokio::test]
+async fn removing_while_the_install_is_still_downloading_cancels_it() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/slow/manifest.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(MANIFEST)
+                .set_delay(Duration::from_millis(400)),
+        )
+        .mount(&server)
+        .await;
+    let url = format!("{}/slow/manifest.json", server.uri());
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+
+    core.send(Command::InstallAddon { url: url.clone() });
+    core.send(Command::RemoveAddon { url });
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    assert!(core.state().addons.is_empty());
+}
+
+#[tokio::test]
 async fn a_removed_addon_can_be_installed_again() {
     let server = serve(MANIFEST, "/one/manifest.json").await;
     let url = format!("{}/one/manifest.json", server.uri());

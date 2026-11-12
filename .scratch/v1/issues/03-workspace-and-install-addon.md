@@ -114,11 +114,11 @@ Catalogs, posters, playback, settings, sign-in.
 - The raw manifest text is what is stored in `manifest_json`; a state change is published only after the row is committed. All disk work runs through one worker so results cannot overtake each other.
 - Dropping `Core` stops and joins its thread.
 - A saved row whose manifest no longer parses is left out of `State.addons` without a notice. If a later ticket tightens `Manifest`, handle old rows then.
-- Known edge: removing an addon while a fetch of the same URL is still in flight lets the late save bring it back.
+- Removing an addon while its install is still downloading cancels that install (the app task keeps a map of downloads in flight).
 - Installing a URL that is already installed refreshes its manifest and keeps its place; installing a removed one brings the row back at the end.
 
 **Verified**
-- `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`: all pass (10 unit tests, 11 integration tests, 1 ignored).
+- `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`: all pass (10 unit tests, 12 integration tests, 1 ignored).
 - `cargo test -p streem-core -- --ignored` passes with internet access (real Cinemeta through a `stremio://` URL).
 - `cargo run -p streem-desktop` with an empty `STREEM_DATA_DIR`: took a screenshot of the window on Windows 11; it shows the install field, and Cinemeta 3.0.14 with its description and a Remove button. Not run on Linux. Install and Remove were not clicked in the real window; they are covered by the `Core` tests.
 - `grep -rn "reqwest\|rusqlite\|std::fs" crates/desktop/src` prints nothing.

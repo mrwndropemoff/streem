@@ -4,22 +4,22 @@
 //! as a [`Message`]. All disk work goes through one worker, so results arrive in the order the
 //! writes were made.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::addon::client::{
-    AddonError, fetch_manifest, http_client, normalize_url, parse_manifest,
-};
+use crate::addon::client::{fetch_manifest, http_client, normalize_url, parse_manifest};
 use crate::store::{Store, StoreError, StoredAddon};
 use crate::{Command, InstalledAddon, Notice, State};
 
 /// What the task receives: the UI's commands, and results of work it started.
 pub(crate) enum Message {
     Command(Command),
-    /// A manifest was downloaded and is valid: the **addon**'s URL and the manifest text.
-    Fetched(Result<(String, String), String>),
+    /// The install started with this id finished downloading: the valid manifest text, or text
+    /// for a [`Notice`].
+    Fetched(u64, Result<String, String>),
     /// A disk job finished. The error is text for a [`Notice`].
     Stored(Result<StoreOutput, String>),
 }
@@ -61,6 +61,9 @@ impl App {
         let mut state = State::default();
         let mut published = Arc::new(state.clone());
         let mut next_notice_id = 1;
+        // Installs still downloading, by id, with the **addon** URL. Removing it cancels them.
+        let mut downloading: HashMap<u64, String> = HashMap::new();
+        let mut next_download_id = 1;
 
         loop {
             let message = tokio::select! {
@@ -73,14 +76,22 @@ impl App {
             match message {
                 Message::Command(Command::InstallAddon { url }) => to_install.push(url),
                 Message::Command(Command::RemoveAddon { url }) => {
+                    downloading.retain(|_, downloading_url| *downloading_url != url);
                     let _ = jobs.send(StoreJob::Remove { url });
                 }
                 Message::Command(Command::DismissNotice) => state.notice = None,
-                Message::Fetched(Ok((url, manifest_json))) => {
-                    let _ = jobs.send(StoreJob::Upsert { url, manifest_json });
-                }
-                Message::Fetched(Err(text)) => {
-                    state.notice = Some(notice(&mut next_notice_id, text));
+                Message::Fetched(id, result) => {
+                    // Not in the map: the **addon** was removed while it was downloading.
+                    if let Some(url) = downloading.remove(&id) {
+                        match result {
+                            Ok(manifest_json) => {
+                                let _ = jobs.send(StoreJob::Upsert { url, manifest_json });
+                            }
+                            Err(text) => {
+                                state.notice = Some(notice(&mut next_notice_id, text));
+                            }
+                        }
+                    }
                 }
                 Message::Stored(Ok(output)) => {
                     state.addons = output.addons;
@@ -93,8 +104,19 @@ impl App {
                 }
             }
 
-            for url in to_install {
-                spawn_install(&client, self.sender.clone(), url);
+            for input in to_install {
+                match normalize_url(&input) {
+                    Ok(url) => {
+                        let id = next_download_id;
+                        next_download_id += 1;
+                        downloading.insert(id, url.clone());
+                        spawn_download(&client, self.sender.clone(), id, url, input);
+                    }
+                    Err(error) => {
+                        let text = format!("Could not install {}: {error}", input.trim());
+                        state.notice = Some(notice(&mut next_notice_id, text));
+                    }
+                }
             }
             if *published != state {
                 published = Arc::new(state.clone());
@@ -115,17 +137,20 @@ fn notice(next_id: &mut u64, text: String) -> Notice {
 }
 
 /// Downloads and checks the manifest in the background, then reports back.
-fn spawn_install(client: &reqwest::Client, sender: mpsc::UnboundedSender<Message>, input: String) {
+fn spawn_download(
+    client: &reqwest::Client,
+    sender: mpsc::UnboundedSender<Message>,
+    id: u64,
+    url: String,
+    input: String,
+) {
     let client = client.clone();
     tokio::spawn(async move {
-        let result = async {
-            let url = normalize_url(&input)?;
-            let (_manifest, text) = fetch_manifest(&client, &url).await?;
-            Ok::<_, AddonError>((url, text))
-        }
-        .await
-        .map_err(|error| format!("Could not install {}: {error}", input.trim()));
-        let _ = sender.send(Message::Fetched(result));
+        let result = fetch_manifest(&client, &url)
+            .await
+            .map(|(_manifest, text)| text)
+            .map_err(|error| format!("Could not install {}: {error}", input.trim()));
+        let _ = sender.send(Message::Fetched(id, result));
     });
 }
 
