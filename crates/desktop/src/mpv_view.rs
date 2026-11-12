@@ -3,10 +3,13 @@
 //!
 //! It is the only place that talks to mpv, and it takes its orders from `State.playback`: every
 //! frame [`MpvView::sync`] compares mpv with what `Core` says and corrects mpv, then tells `Core`
-//! what mpv is doing with `Command::ReportPlayback`. The controls never come here.
+//! what mpv is doing with `Command::ReportPlayback`. The controls never come here, with one
+//! exception: the audio and subtitle menus read mpv's track list with [`MpvView::tracks`] and
+//! pick a track directly, because which track is shown is local to the player.
 
 use std::ffi::{CStr, CString, c_void};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use eframe::{egui, egui_glow, glow, glow::HasContext};
@@ -14,10 +17,33 @@ use libmpv2::Mpv;
 use libmpv2::events::Event;
 use libmpv2::mpv_end_file_reason;
 use libmpv2::render::{OpenGLInitParams, RenderContext, RenderParam, RenderParamApiType};
-use streem_core::{Command, Core, Playback, PlaybackReport};
+use streem_core::{Command, Core, Playback, PlaybackReport, SubtitleTrack};
 
 /// While playing, `Core` hears about the position this often.
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// One audio or subtitle track of the loaded file, as a menu shows it.
+pub struct Track {
+    /// mpv's id for it, which [`MpvView::select_audio`] and [`MpvView::select_subtitle`] take.
+    pub id: i64,
+    pub label: String,
+    pub selected: bool,
+}
+
+/// The tracks of the loaded file, in menu order.
+#[derive(Default)]
+pub struct Tracks {
+    pub audio: Vec<Track>,
+    /// The tracks inside the file, then the ones supplied by **addons**.
+    pub subtitles: Vec<Track>,
+}
+
+/// A subtitle from an **addon** to add to the file with this generation.
+struct SubtitleJob {
+    file: u64,
+    url: String,
+    lang: String,
+}
 
 type GlLoader = Arc<dyn Fn(&CStr) -> *const c_void + Send + Sync>;
 
@@ -44,6 +70,12 @@ pub struct MpvView {
     /// What was last sent to `Core`.
     last_report: Option<Instant>,
     last_buffering: bool,
+    /// How many of `Playback::subtitles` were handed to the subtitle worker for this file.
+    subtitles_added: usize,
+    /// Grows with every load and stop, so the subtitle worker can drop what was meant for an
+    /// earlier file.
+    file_generation: Arc<AtomicU64>,
+    subtitle_worker: mpsc::Sender<SubtitleJob>,
 }
 
 impl MpvView {
@@ -88,6 +120,9 @@ impl MpvView {
         let repaint = cc.egui_ctx.clone();
         render.set_update_callback(move || repaint.request_repaint());
 
+        let file_generation = Arc::new(AtomicU64::new(0));
+        let subtitle_worker = spawn_subtitle_worker(mpv, file_generation.clone())?;
+
         Ok(MpvView {
             mpv,
             render: Arc::new(GlRender(render)),
@@ -96,7 +131,79 @@ impl MpvView {
             applied_seek: 0,
             last_report: None,
             last_buffering: false,
+            subtitles_added: 0,
+            file_generation,
+            subtitle_worker,
         })
+    }
+
+    /// The audio and subtitle tracks mpv has for the loaded file. A subtitle track whose file
+    /// is one of `addon_subtitles` is labelled "language · addon name" and listed last.
+    pub fn tracks(&self, addon_subtitles: &[SubtitleTrack]) -> Tracks {
+        let mut tracks = Tracks::default();
+        let mut from_addons = Vec::new();
+        let count = self
+            .mpv
+            .get_property::<i64>("track-list/count")
+            .unwrap_or(0);
+        for index in 0..count {
+            let key = |name: &str| format!("track-list/{index}/{name}");
+            let text = |name: &str| {
+                self.mpv
+                    .get_property::<String>(&key(name))
+                    .ok()
+                    .filter(|text| !text.is_empty())
+            };
+            let (Some(kind), Ok(id)) = (text("type"), self.mpv.get_property::<i64>(&key("id")))
+            else {
+                continue;
+            };
+            let selected = self
+                .mpv
+                .get_property::<bool>(&key("selected"))
+                .unwrap_or(false);
+            let label = track_label(id, text("lang"), text("title"));
+            match kind.as_str() {
+                "audio" => tracks.audio.push(Track {
+                    id,
+                    label,
+                    selected,
+                }),
+                "sub" => {
+                    let file = text("external-filename");
+                    match addon_subtitles
+                        .iter()
+                        .find(|track| file.as_deref() == Some(track.url.as_str()))
+                    {
+                        Some(track) => from_addons.push(Track {
+                            id,
+                            label: addon_label(track),
+                            selected,
+                        }),
+                        None => tracks.subtitles.push(Track {
+                            id,
+                            label,
+                            selected,
+                        }),
+                    }
+                }
+                _ => {}
+            }
+        }
+        tracks.subtitles.extend(from_addons);
+        tracks
+    }
+
+    pub fn select_audio(&self, id: i64) {
+        let _ = self.mpv.set_property("aid", id);
+    }
+
+    /// `None` hides the subtitles.
+    pub fn select_subtitle(&self, id: Option<i64>) {
+        let _ = match id {
+            Some(id) => self.mpv.set_property("sid", id),
+            None => self.mpv.set_property("sid", "no"),
+        };
     }
 
     /// Draws the current video frame into `rect`, which must be the whole window: mpv draws
@@ -163,6 +270,9 @@ impl MpvView {
                 .mpv
                 .command("seek", &[&seek.position_secs.to_string(), "absolute"]);
         }
+        if self.file_loaded {
+            self.add_subtitles(playback);
+        }
 
         let buffering = !self.file_loaded || self.flag("paused-for-cache");
         let due = self
@@ -194,6 +304,25 @@ impl MpvView {
         self.applied_seek = 0;
         self.last_report = None;
         self.last_buffering = false;
+        self.subtitles_added = 0;
+        self.file_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Hands the **addon** subtitles mpv does not have yet to the subtitle worker. Only once
+    /// the file is loaded, since mpv cannot add a subtitle to a file it has not opened.
+    fn add_subtitles(&mut self, playback: &Playback) {
+        let Some(new) = playback.subtitles.get(self.subtitles_added..) else {
+            return;
+        };
+        let file = self.file_generation.load(Ordering::SeqCst);
+        for track in new {
+            let _ = self.subtitle_worker.send(SubtitleJob {
+                file,
+                url: track.url.clone(),
+                lang: track.lang.clone(),
+            });
+        }
+        self.subtitles_added = playback.subtitles.len();
     }
 
     /// Tells `Core` what mpv is doing now.
@@ -241,4 +370,47 @@ impl MpvView {
             .filter(|value| value.is_finite())
             .unwrap_or(0.0)
     }
+}
+
+/// Adds **addon** subtitles to mpv on a thread of its own. `sub-add` downloads the file before
+/// it returns, and a subtitles **addon** can offer dozens, so doing it on the UI thread would
+/// freeze the window. A subtitle meant for a file that is no longer loaded is dropped.
+fn spawn_subtitle_worker(
+    mpv: &'static Mpv,
+    file_generation: Arc<AtomicU64>,
+) -> Result<mpsc::Sender<SubtitleJob>, String> {
+    let (sender, jobs) = mpsc::channel::<SubtitleJob>();
+    std::thread::Builder::new()
+        .name("mpv-subtitles".into())
+        .spawn(move || {
+            for job in jobs {
+                if job.file != file_generation.load(Ordering::SeqCst) {
+                    continue;
+                }
+                // `auto` adds it without selecting it. Its title and language are both the
+                // language the **addon** gave. A file mpv cannot read is simply not added.
+                let _ = mpv.command("sub-add", &[&job.url, "auto", &job.lang, &job.lang]);
+            }
+        })
+        .map_err(|error| format!("the subtitle thread could not start: {error}"))?;
+    Ok(sender)
+}
+
+/// A track inside the file: "language · title", either one alone, or its number.
+fn track_label(id: i64, lang: Option<String>, title: Option<String>) -> String {
+    match (lang, title) {
+        (Some(lang), Some(title)) => format!("{lang} · {title}"),
+        (Some(text), None) | (None, Some(text)) => text,
+        (None, None) => format!("Track {id}"),
+    }
+}
+
+/// A track supplied by an **addon**: "language · addon name".
+fn addon_label(track: &SubtitleTrack) -> String {
+    let lang = if track.lang.is_empty() {
+        "Unknown language"
+    } else {
+        &track.lang
+    };
+    format!("{lang} · {}", track.addon_name)
 }

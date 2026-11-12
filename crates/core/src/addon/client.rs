@@ -1,10 +1,10 @@
-//! Talking to an **addon** over HTTP: its manifest, catalogs, metas and streams.
+//! Talking to an **addon** over HTTP: its manifest, catalogs, metas, streams and subtitles.
 
 use std::time::Duration;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
-use super::types::{Manifest, Meta, MetaPreview, Stream, Video};
+use super::types::{Manifest, Meta, MetaPreview, Stream, Subtitle, Video};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AddonError {
@@ -24,6 +24,8 @@ pub enum AddonError {
     InvalidMeta(serde_json::Error),
     #[error("the addon's list of streams is not valid: {0}")]
     InvalidStreams(serde_json::Error),
+    #[error("the addon's list of subtitles is not valid: {0}")]
+    InvalidSubtitles(serde_json::Error),
 }
 
 /// Turns what the user typed into the URL that identifies the **addon**.
@@ -203,6 +205,43 @@ pub async fn fetch_streams(client: &reqwest::Client, url: &str) -> Result<Vec<St
         .collect())
 }
 
+/// The URL of a subtitles request: `{base}/subtitles/{type}/{videoId}.json`, with the same
+/// video id as a stream request.
+pub fn subtitles_url(
+    manifest_url: &str,
+    meta_type: &str,
+    video_id: &str,
+) -> Result<String, AddonError> {
+    resource_url(manifest_url, "subtitles", meta_type, video_id, None)
+}
+
+/// Downloads the subtitles an **addon** offers for one video. An entry without a `url` is
+/// skipped, so one bad entry does not hide the rest.
+pub async fn fetch_subtitles(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<Vec<Subtitle>, AddonError> {
+    #[derive(serde::Deserialize)]
+    struct Response {
+        #[serde(default)]
+        subtitles: Option<Vec<serde_json::Value>>,
+    }
+
+    let response = client.get(url).send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(AddonError::Status(status.as_u16()));
+    }
+    let text = response.text().await?;
+    let parsed: Response = serde_json::from_str(&text).map_err(AddonError::InvalidSubtitles)?;
+    Ok(parsed
+        .subtitles
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|subtitle| serde_json::from_value(subtitle).ok())
+        .collect())
+}
+
 /// Downloads the description of one title. A movie that comes back with no videos gets one
 /// whose id is the meta id, so there is always something to play.
 pub async fn fetch_meta(
@@ -269,6 +308,10 @@ mod tests {
         assert_eq!(
             stream_url(base, "series", "tt1:1:2").unwrap(),
             "https://example.com/a/stream/series/tt1:1:2.json"
+        );
+        assert_eq!(
+            subtitles_url(base, "series", "tt1:1:2").unwrap(),
+            "https://example.com/a/subtitles/series/tt1:1:2.json"
         );
     }
 

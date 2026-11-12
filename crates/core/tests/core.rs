@@ -1889,3 +1889,185 @@ async fn searching_the_real_cinemeta_gives_movie_and_series_rows() {
     assert!(with_results.contains(&"movie"), "{rows:?}");
     assert!(with_results.contains(&"series"), "{rows:?}");
 }
+
+// ---- Subtitles ------------------------------------------------------------------------------
+
+use streem_core::SubtitleTrack;
+
+const SUBTITLES_PATH: &str = "/subs/subtitles/movie/tt1.json";
+
+/// An **addon** named "subs" that offers only the `subtitles` resource, for `tt` ids.
+async fn serve_subtitles_addon(server: &MockServer) -> String {
+    let manifest = r#"{"id": "org.example.subs", "version": "1.0.0", "name": "Subs",
+        "types": ["movie", "series"], "resources": ["subtitles"], "idPrefixes": ["tt"]}"#;
+    serve_json(server, "/subs/manifest.json", 200, manifest).await;
+    format!("{}/subs/manifest.json", server.uri())
+}
+
+/// Answers the subtitles request for `tt1` after `delay`, at most `times` times.
+async fn serve_subtitles(server: &MockServer, delay: Duration, times: u64, body: &str) {
+    Mock::given(method("GET"))
+        .and(path(SUBTITLES_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(body)
+                .set_delay(delay),
+        )
+        .up_to_n_times(times)
+        .mount(server)
+        .await;
+}
+
+/// Like [`core_ready_to_play`], with the "subs" **addon** installed as well.
+async fn core_with_subtitles_addon(server: &MockServer, dir: &Path) -> Core {
+    let subs = serve_subtitles_addon(server).await;
+    let core = core_ready_to_play(server, dir).await;
+    install(&core, subs, 3).await;
+    core
+}
+
+async fn subtitles_requests(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.url.path() == SUBTITLES_PATH)
+        .count()
+}
+
+async fn wait_for_subtitles_requests(server: &MockServer, count: usize) {
+    for _ in 0..250 {
+        if subtitles_requests(server).await >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the subtitles addon was asked fewer than {count} times");
+}
+
+fn langs(state: &State) -> Vec<String> {
+    playback(state)
+        .subtitles
+        .iter()
+        .map(|track| track.lang.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn play_starts_at_once_and_the_subtitles_are_added_when_they_arrive() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    serve_subtitles(
+        &server,
+        Duration::from_millis(600),
+        u64::MAX,
+        r#"{"subtitles": [
+            {"id": "1", "url": "https://subs.example/en.srt", "lang": "eng"},
+            {"id": "2", "url": "file:///etc/passwd", "lang": "bad"},
+            {"id": "3", "lang": "no url"},
+            {"id": "4", "url": "http://subs.example/fr.srt", "lang": "fre"}
+        ]}"#,
+    )
+    .await;
+    let core = core_with_subtitles_addon(&server, dir.path()).await;
+
+    let state = play_direct(&core).await;
+    assert!(playback(&state).subtitles.is_empty());
+    // An unplayable stream starts nothing, so it must not throw the arriving tracks away.
+    core.send(Command::Play {
+        addon_id: "org.example.one".into(),
+        stream_index: 0,
+    });
+
+    let state = wait_for(&core, "subtitles added", |s| {
+        s.playback.as_ref().is_some_and(|p| !p.subtitles.is_empty())
+    })
+    .await;
+    assert_eq!(
+        playback(&state).subtitles,
+        [
+            SubtitleTrack {
+                lang: "eng".into(),
+                url: "https://subs.example/en.srt".into(),
+                addon_name: "Subs".into(),
+            },
+            SubtitleTrack {
+                lang: "fre".into(),
+                url: "http://subs.example/fr.srt".into(),
+                addon_name: "Subs".into(),
+            },
+        ]
+    );
+    assert_eq!(subtitles_requests(&server).await, 1);
+    assert!(!format!("{state:?}").contains("subs.example"));
+}
+
+#[tokio::test]
+async fn a_failing_subtitles_addon_leaves_playback_alone_and_raises_no_notice() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    serve_json(&server, SUBTITLES_PATH, 500, "oops").await;
+    let core = core_with_subtitles_addon(&server, dir.path()).await;
+
+    play_direct(&core).await;
+    wait_for_subtitles_requests(&server, 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let state = core.state();
+    assert!(playback(&state).subtitles.is_empty());
+    assert!(state.notice.is_none());
+}
+
+#[tokio::test]
+async fn subtitles_arriving_after_stop_playback_are_discarded() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    // The first request is answered late with "old"; the second at once with "new".
+    serve_subtitles(
+        &server,
+        Duration::from_millis(600),
+        1,
+        r#"{"subtitles": [{"id": "1", "url": "https://subs.example/old.srt", "lang": "old"}]}"#,
+    )
+    .await;
+    serve_subtitles(
+        &server,
+        Duration::ZERO,
+        u64::MAX,
+        r#"{"subtitles": [{"id": "2", "url": "https://subs.example/new.srt", "lang": "new"}]}"#,
+    )
+    .await;
+    let core = core_with_subtitles_addon(&server, dir.path()).await;
+
+    play_direct(&core).await;
+    wait_for_subtitles_requests(&server, 1).await;
+    core.send(Command::StopPlayback);
+    wait_for(&core, "playback cleared", |s| s.playback.is_none()).await;
+    play_direct(&core).await;
+
+    let state = wait_for(&core, "new subtitles added", |s| {
+        s.playback.as_ref().is_some_and(|p| !p.subtitles.is_empty())
+    })
+    .await;
+    assert_eq!(langs(&state), ["new"]);
+    // Long enough for the "old" answer to have arrived.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(langs(&core.state()), ["new"]);
+}
+
+#[tokio::test]
+async fn an_addon_without_subtitles_for_this_id_is_not_asked() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = r#"{"id": "org.example.subs", "version": "1.0.0", "name": "Subs",
+        "types": ["movie"], "resources": ["subtitles"], "idPrefixes": ["kitsu:"]}"#;
+    serve_json(&server, "/subs/manifest.json", 200, manifest).await;
+    let core = core_ready_to_play(&server, dir.path()).await;
+    install(&core, format!("{}/subs/manifest.json", server.uri()), 3).await;
+
+    play_direct(&core).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(subtitles_requests(&server).await, 0);
+}

@@ -219,6 +219,16 @@ pub struct Stream {
     pub source: StreamSource,
 }
 
+/// One entry of a subtitles response: a subtitle file an **addon** offers for one video.
+///
+/// Only the `url` is required; an entry without one is skipped.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Subtitle {
+    pub url: String,
+    #[serde(default, deserialize_with = "text_or_number")]
+    pub lang: Option<String>,
+}
+
 /// Where a [`Stream`] is played from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamSource {

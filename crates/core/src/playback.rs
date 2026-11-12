@@ -3,7 +3,7 @@
 //!
 //! Nothing here logs. A stream's link can hold a **debrid service** key.
 
-use crate::{Details, Load, Playback, PlaybackReport, SeekRequest, State};
+use crate::{Details, Load, Playback, PlaybackReport, SeekRequest, State, SubtitleTrack};
 
 /// The notice raised when the player could not play a stream.
 pub(crate) const FAILED_NOTICE: &str = "This stream could not be played. Pick another one.";
@@ -26,10 +26,20 @@ pub(crate) enum Reported {
 }
 
 /// Starts playing a stream of the open title. Does nothing when there is no such stream or it
-/// cannot be played.
-pub(crate) fn play(state: &mut State, links: &Links, addon_id: &str, stream_index: usize) {
-    if let Some(playback) = start(state, links, addon_id, stream_index) {
-        state.playback = Some(playback);
+/// cannot be played. Returns whether a new playback started.
+pub(crate) fn play(state: &mut State, links: &Links, addon_id: &str, stream_index: usize) -> bool {
+    let Some(playback) = start(state, links, addon_id, stream_index) else {
+        return false;
+    };
+    state.playback = Some(playback);
+    true
+}
+
+/// Adds the tracks one **addon** offers to what is playing. The caller has already checked
+/// that they were asked for this playback.
+pub(crate) fn add_subtitles(state: &mut State, tracks: Vec<SubtitleTrack>) {
+    if let Some(playback) = state.playback.as_mut() {
+        playback.subtitles.extend(tracks);
     }
 }
 
@@ -64,6 +74,7 @@ fn start(state: &State, links: &Links, addon_id: &str, stream_index: usize) -> O
         position_secs: 0.0,
         duration_secs: 0.0,
         buffering: false,
+        subtitles: Vec::new(),
     })
 }
 
