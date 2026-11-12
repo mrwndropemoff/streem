@@ -87,7 +87,7 @@ Clicking a poster, search, continue-watching, pagination.
 
 ## Human check
 
-- [ ] Scrolling vertically and horizontally stays smooth while posters are still loading.
+- [x] Scrolling vertically and horizontally stays smooth while posters are still loading.
 
 ## Rules
 
@@ -114,4 +114,4 @@ Clicking a poster, search, continue-watching, pagination.
 - Tests against `wiremock`: two catalogs go `Loading` then `Ready`; HTTP 500 gives one `Failed` row while the other is `Ready`; a required extra gives no row; type and id are percent-encoded; `LoadHome` refetches; removal clears the rows; rows appear after a restart; the same poster requested twice makes one request and arrives scaled to 300 px wide; a new `Core` on the same data directory serves it with no request; a broken poster is requested once.
 - `cargo run -p streem-desktop` with an empty `STREEM_DATA_DIR` on Windows 11: screenshot shows Cinemeta's rows ("Popular · movie", "Popular · series", "Featured · movie") with posters and names, and 31 files in `<data_dir>/posters`. The Home/Addons top bar was not clicked in the real window.
 - `grep -rn "reqwest\|rusqlite\|std::fs" crates/desktop/src` prints nothing.
-- Not verified: the Human check (smooth scrolling while posters load) is left for a person to do.
+- Human check done by the user: vertical and horizontal scrolling stayed smooth while posters loaded, and the Home/Addons top bar worked. All posters loaded in their run; the failed-poster case was not seen.
