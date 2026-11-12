@@ -244,9 +244,12 @@ impl From<RawStream> for Stream {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
         let filename = hinted_filename.or_else(|| raw.url.as_deref().and_then(filename_in_url));
+        // An `infoHash` makes it a torrent, even next to a `magnet:` link, unless the
+        // **addon** also gives an `http(s)` link that can be played instead.
         let source = match (raw.url, raw.info_hash) {
-            (Some(url), _) => StreamSource::Url(url),
-            (None, Some(_)) => StreamSource::Torrent,
+            (Some(url), _) if is_http(&url) => StreamSource::Url(url),
+            (_, Some(_)) => StreamSource::Torrent,
+            (Some(url), None) => StreamSource::Url(url),
             (None, None) => StreamSource::Other,
         };
         Stream {
@@ -260,14 +263,27 @@ impl From<RawStream> for Stream {
 
 /// The last segment of the URL's path, percent-decoded, when it has a file extension
 /// (`My%20Film.mkv` gives `My Film.mkv`). The query string is not part of it.
+///
+/// The extension is read before decoding, so an encoded `?` or `#` cannot end up in it, and it
+/// must be letters and digits with at least one letter, so `v1.2` is not a file.
 fn filename_in_url(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
     let last = parsed.path_segments()?.next_back()?;
+    let (stem, extension) = last.rsplit_once('.')?;
+    let is_extension = extension.chars().all(|c| c.is_ascii_alphanumeric())
+        && extension.chars().any(|c| c.is_ascii_alphabetic());
+    if stem.is_empty() || !is_extension {
+        return None;
+    }
     let decoded = percent_encoding::percent_decode_str(last)
         .decode_utf8()
         .ok()?;
-    let (stem, extension) = decoded.rsplit_once('.')?;
-    (!stem.is_empty() && !extension.is_empty()).then(|| decoded.into_owned())
+    Some(decoded.into_owned())
+}
+
+/// Only `http://` and `https://` links can be played.
+pub(crate) fn is_http(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
 }
 
 fn text_or_number<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>

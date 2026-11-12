@@ -1041,3 +1041,162 @@ async fn a_failing_addon_gives_a_failed_group_and_leaves_the_others_intact() {
     };
     assert_eq!(streams[0].name, "Good");
 }
+
+#[tokio::test]
+async fn an_info_hash_gives_the_torrent_reason_unless_the_url_is_http() {
+    let server = MockServer::start().await;
+    let one = serve_stream_addon(&server, "one", r#""stream""#).await;
+    serve_json(
+        &server,
+        "/one/stream/movie/tt1.json",
+        200,
+        r#"{"streams": [
+            {"name": "Magnet", "url": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+             "infoHash": "0123456789abcdef0123456789abcdef01234567"},
+            {"name": "Link and hash", "url": "https://cdn.example/a.mkv",
+             "infoHash": "0123456789abcdef0123456789abcdef01234567"},
+            {"name": "Other scheme", "url": "rtmp://live.example/a"}
+        ]}"#,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_with_title(&server, dir.path(), vec![one], "movie", "tt1").await;
+
+    let list = load_streams(&core, "tt1").await;
+
+    let Load::Ready(streams) = &group(&list, "org.example.one").streams else {
+        panic!("not ready: {list:?}")
+    };
+    let reasons: Vec<Option<&str>> = streams
+        .iter()
+        .map(|stream| stream.unplayable_reason.as_deref())
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            Some("Torrent streams are not supported"),
+            None,
+            Some("This kind of stream is not supported"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_url_gives_a_filename_only_when_its_last_segment_has_a_real_extension() {
+    let server = MockServer::start().await;
+    let one = serve_stream_addon(&server, "one", r#""stream""#).await;
+    serve_json(
+        &server,
+        "/one/stream/movie/tt1.json",
+        200,
+        r#"{"streams": [
+            {"name": "Encoded question mark", "url": "https://cdn.example/a.mkv%3Fx"},
+            {"name": "Version number", "url": "https://cdn.example/api/v1.2"},
+            {"name": "Fragment", "url": "https://cdn.example/Film.mp4#t=10"}
+        ]}"#,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_with_title(&server, dir.path(), vec![one], "movie", "tt1").await;
+
+    let list = load_streams(&core, "tt1").await;
+
+    let Load::Ready(streams) = &group(&list, "org.example.one").streams else {
+        panic!("not ready: {list:?}")
+    };
+    let filenames: Vec<Option<&str>> = streams
+        .iter()
+        .map(|stream| stream.filename.as_deref())
+        .collect();
+    assert_eq!(filenames, [None, None, Some("Film.mp4")]);
+}
+
+#[tokio::test]
+async fn an_addon_whose_types_or_id_prefixes_do_not_match_is_not_asked() {
+    let server = MockServer::start().await;
+    let series_only = serve_stream_addon(
+        &server,
+        "series-only",
+        r#"{"name": "stream", "types": ["series"]}"#,
+    )
+    .await;
+    let other_ids = serve_stream_addon(
+        &server,
+        "other-ids",
+        r#"{"name": "stream", "idPrefixes": ["kitsu:"]}"#,
+    )
+    .await;
+    let good = serve_stream_addon(&server, "good", r#""stream""#).await;
+    serve_json(
+        &server,
+        "/good/stream/movie/tt1.json",
+        200,
+        r#"{"streams": [{"name": "Good", "url": "https://cdn/a.mkv"}]}"#,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_with_title(
+        &server,
+        dir.path(),
+        vec![series_only, other_ids, good],
+        "movie",
+        "tt1",
+    )
+    .await;
+
+    let list = load_streams(&core, "tt1").await;
+
+    let ids: Vec<&str> = list.groups.iter().map(|g| g.addon_id.as_str()).collect();
+    assert_eq!(ids, ["org.example.good"]);
+    let asked_others = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|request| {
+            let path = request.url.path();
+            path.starts_with("/series-only/stream/") || path.starts_with("/other-ids/stream/")
+        });
+    assert!(!asked_others);
+}
+
+#[tokio::test]
+async fn streams_for_an_earlier_episode_that_arrive_late_are_ignored() {
+    let server = MockServer::start().await;
+    let one = serve_stream_addon(&server, "one", r#""stream""#).await;
+    Mock::given(method("GET"))
+        .and(path("/one/stream/series/tt2:1:1.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(
+                    r#"{"streams": [{"name": "Episode 1", "url": "https://cdn/1.mkv"}]}"#,
+                )
+                .set_delay(Duration::from_millis(400)),
+        )
+        .mount(&server)
+        .await;
+    serve_json(
+        &server,
+        "/one/stream/series/tt2:1:2.json",
+        200,
+        r#"{"streams": [{"name": "Episode 2", "url": "https://cdn/2.mkv"}]}"#,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_with_title(&server, dir.path(), vec![one], "series", "tt2").await;
+
+    core.send(Command::LoadStreams {
+        video_id: "tt2:1:1".into(),
+    });
+    load_streams(&core, "tt2:1:2").await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    let state = core.state();
+    let list = stream_list(&state).unwrap();
+    assert_eq!(list.video_id, "tt2:1:2");
+    let Load::Ready(streams) = &group(list, "org.example.one").streams else {
+        panic!("not ready: {list:?}")
+    };
+    let names: Vec<&str> = streams.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["Episode 2"]);
+}

@@ -14,7 +14,9 @@ use crate::addon::client::{
     catalog_url, fetch_catalog, fetch_manifest, fetch_meta, fetch_streams, http_client, meta_url,
     normalize_url, parse_manifest, stream_url,
 };
-use crate::addon::types::{Manifest, ManifestCatalog, Meta, MetaPreview, Stream, StreamSource};
+use crate::addon::types::{
+    Manifest, ManifestCatalog, Meta, MetaPreview, Stream, StreamSource, is_http,
+};
 use crate::posters::{self, Poster, PosterCache};
 use crate::store::{Store, StoreError, StoredAddon};
 use crate::{
@@ -472,10 +474,6 @@ fn stream_item(stream: Stream) -> StreamItem {
         playable: unplayable_reason.is_none(),
         unplayable_reason: unplayable_reason.map(str::to_string),
     }
-}
-
-fn is_http(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://")
 }
 
 /// Loads a poster in the background, then reports back.
