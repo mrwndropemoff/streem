@@ -36,10 +36,10 @@ It needs a Windows machine and someone looking at the video.
 
 ## Acceptance checks
 
-- [ ] Every "Human check" box in ticket 01 is ticked for Linux.
-- [ ] The same list passes on Windows, or the failure is written down.
-- [ ] Either `docs/adr/0002-egui-for-the-desktop-ui.md` exists, or a Slint prototype ticket exists.
-- [ ] The Windows build steps are written under `## Comments`.
+- [x] Every "Human check" box in ticket 01 is ticked for Linux.
+- [x] The same list passes on Windows, or the failure is written down.
+- [x] Either `docs/adr/0002-egui-for-the-desktop-ui.md` exists, or a Slint prototype ticket exists.
+- [x] The Windows build steps are written under `## Comments`.
 
 ## Comments
 **Agent prep notes (2026-11-12). Unverified: nothing here was run on Windows. No box above is ticked.**
@@ -48,3 +48,50 @@ It needs a Windows machine and someone looking at the video.
 - Linking: `libmpv2-sys` 4.0.1 emits `cargo:rustc-link-lib=mpv` and nothing else (no Windows logic, no `MPV_SOURCE` unless the `build_libmpv` feature is on). On MSVC the linker looks for `mpv.lib`. The `mpv-dev` archive ships `libmpv.dll.a` and `mpv.def`, not an MSVC `.lib`. Likely fix (try first): in a VS developer prompt run `lib /def:mpv.def /machine:x64 /out:mpv.lib`, then set `RUSTFLAGS=-L native=<dir with mpv.lib>`. Fallback: the `x86_64-pc-windows-gnu` target, which can use `libmpv.dll.a` directly.
 - The DLL must be next to the `.exe` (`target\release\`). Check its actual name in the archive before copying; the ticket says `libmpv-2.dll`.
 - Rewrite this section with the steps that actually worked.
+
+---
+
+**Outcome A (2026-11-12): both systems pass.** The agent verified the build and a headless run on Windows 11; the human then ran the check list below and all six items passed. `docs/adr/0002-egui-for-the-desktop-ui.md` is written. Tickets 03 onward can start on egui.
+
+### What I verified on this machine
+
+- Toolchain: `rustc 1.99.1`, host and only target `x86_64-pc-windows-msvc`.
+- `cargo build --release` in `prototypes/egui-mpv` finishes with exit code 0. The tree was already built, so this was an up-to-date check, not a clean build.
+- Run of `target\release\egui-mpv-prototype.exe sample\sample.mkv` for 20 s:
+  - still running at the end;
+  - one window, titled `egui-mpv prototype`;
+  - 19 `time-pos` lines, 0.7 to 18.7, strictly increasing by 1.0 s each;
+  - stderr empty, no panic, no mpv warning or error line.
+- The first log lines read `aid=1 sid=no`. Subtitles start off on Windows. I did not compare this with Linux.
+
+### How linking is set up here (found, not created by me)
+
+- `C:\libmpv` holds `libmpv-2.dll` and `libmpv.dll.a` (both from the `mpv-dev-x86_64` archive; the DLL reports mpv `v0.42.0-38-gbcde6b93c`), plus `mpv.def`, `mpv.exp`, `mpv.lib` and `exports.txt`. The last four were generated at 09:52 today, which matches the `lib /def:mpv.def /machine:x64 /out:mpv.lib` fix from the prep notes. I did not see the commands run, so confirm that.
+- The linker finds `mpv.lib` through `%USERPROFILE%\.cargo\config.toml`:
+  ```toml
+  [target.x86_64-pc-windows-msvc]
+  rustflags = ["-L", "native=C:\\libmpv"]
+  ```
+  `RUSTFLAGS` and `MPV_SOURCE` are unset. This is a per-user file outside the repo, so a fresh clone on another machine will not link until it is repeated.
+- `libmpv-2.dll` is copied by hand into `target\release\` (the DLL name in the archive matches the ticket).
+- `lib.exe` and `link.exe` are not on the plain PowerShell PATH, so `mpv.lib` must have been made from a VS developer prompt.
+
+### Human check on Windows (passed)
+
+- [x] Video is inside the window, not a second window.
+- [x] Control bar drawn over the video and usable.
+- [x] Play/Pause button and seek slider work.
+- [x] Audio track switch changes the tone (`eng` and `fra` sine tones); subtitle switch shows and hides text.
+- [x] Resize and fullscreen (`F`) keep the picture correct.
+- [x] CPU near zero while paused (Task Manager).
+
+### Windows setup steps for ticket 07
+
+These are the steps behind the build that passed. The `mpv.lib` step (3) is inferred from the files in `C:\libmpv`, not watched.
+
+1. `rustup` with the default MSVC toolchain; Visual Studio Build Tools with the C++ workload (needed for `link.exe`, `lib.exe`).
+2. Download `mpv-dev-x86_64` from the Windows builds linked on mpv.io; extract to `C:\libmpv` (`libmpv-2.dll`, `libmpv.dll.a`, `mpv.def`, `include\`).
+3. From a "x64 Native Tools" prompt in `C:\libmpv`: `lib /def:mpv.def /machine:x64 /out:mpv.lib`.
+4. Add the `[target.x86_64-pc-windows-msvc]` block above to `%USERPROFILE%\.cargo\config.toml`.
+5. `cd prototypes\egui-mpv`, `cargo build --release`, copy `C:\libmpv\libmpv-2.dll` into `target\release\`.
+6. `cargo run --release -- sample\sample.mkv`. `sample.mkv` comes from `make-sample.sh` (needs `ffmpeg`/`ffprobe`, which are not installed on this PATH; the existing file is 1,925,889 bytes).
