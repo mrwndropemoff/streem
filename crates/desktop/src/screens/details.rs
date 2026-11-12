@@ -226,19 +226,14 @@ impl DetailsScreen {
 
 /// "Add to library", or "Remove from library" once the title is in it.
 fn library_button(ui: &mut egui::Ui, details: &Details, core: &Core) {
-    let label = if details.in_library {
-        "Remove from library"
-    } else {
-        "Add to library"
-    };
-    if ui.button(label).clicked() {
-        core.send(if details.in_library {
-            Command::RemoveFromLibrary {
+    if details.in_library {
+        if ui.button("Remove from library").clicked() {
+            core.send(Command::RemoveFromLibrary {
                 meta_id: details.meta_id.clone(),
-            }
-        } else {
-            Command::AddToLibrary
-        });
+            });
+        }
+    } else if ui.button("Add to library").clicked() {
+        core.send(Command::AddToLibrary);
     }
 }
 

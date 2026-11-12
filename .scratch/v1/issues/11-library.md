@@ -61,7 +61,7 @@ Sync, per-profile separation, sorting and filtering, a library row on the home s
 
 ## Acceptance checks
 
-- [ ] `cargo test -p streem-core` passes, including tests that: `AddToLibrary` with ready details adds the item and sets `in_library`; with no details it changes nothing; `RemoveFromLibrary` removes it; add, remove, add leaves exactly one item; a new `Core` on the same data directory still lists the item; opening details of a title already in the library has `in_library == true`.
+- [x] `cargo test -p streem-core` passes, including tests that: `AddToLibrary` with ready details adds the item and sets `in_library`; with no details it changes nothing; `RemoveFromLibrary` removes it; add, remove, add leaves exactly one item; a new `Core` on the same data directory still lists the item; opening details of a title already in the library has `in_library == true`.
 - [ ] `cargo run -p streem-desktop`: add a title, see it on the Library screen, restart the app, see it still there, remove it.
 
 ## Rules
@@ -75,3 +75,8 @@ Sync, per-profile separation, sorting and filtering, a library row on the home s
 - When done, tick the boxes and add a line under `## Comments` saying what you verified and how.
 
 ## Comments
+
+- Verified with `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`, all passing. `crates/core/tests/core.rs` has a black-box test for every acceptance case (add with ready details, add with no details, remove, add–remove–add leaves one item, a new `Core` on the same data directory, opening a title already in the library). It also tests adding while the details `Failed`, newest-first order, that a library change does not reload the home rows, and that a change sent just before dropping `Core` is saved. `store.rs` unit tests check `local`/`local`, `deleted`, `dirty` and `updated_at`. Mutation checks: removing the `in_library` update on open, or the library handling in the shutdown drain, makes the matching test fail.
+- Not verified: the `cargo run -p streem-desktop` click-through. The agent could not drive the GUI, so that box is left for a person to tick.
+- For ticket 18: `State.library` is ordered by `updated_at DESC`, which is "most recently added" only while adding is the only write that touches a row that is not deleted. Library writes keep `updated_at` strictly increasing, so two adds in the same millisecond still keep their order. If sync rewrites `updated_at` when it pulls, the order becomes "most recently changed".
+- `AddToLibrary` for a title already in the library saves it again, which moves it to the front. The details button never sends it in that case.

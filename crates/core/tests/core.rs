@@ -2111,6 +2111,7 @@ async fn open_film(core: &Core, meta_id: &str) -> std::sync::Arc<State> {
     })
     .await
 }
+
 fn in_library(state: &State) -> bool {
     state.details.as_ref().is_some_and(|d| d.in_library)
 }
@@ -2154,6 +2155,34 @@ async fn adding_to_the_library_with_no_details_changes_nothing() {
 
     core.send(Command::AddToLibrary);
     // Commands are handled in order, so once this one's notice shows, the add was handled.
+    core.send(Command::InstallAddon {
+        url: "hello".into(),
+    });
+    let state = wait_for(&core, "a notice", |s| s.notice.is_some()).await;
+
+    assert!(state.library.is_empty());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(core.state().library.is_empty());
+}
+
+#[tokio::test]
+async fn adding_to_the_library_while_the_details_failed_changes_nothing() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_with_films(&server, dir.path()).await;
+    // Not served, so the **addon** answers 404.
+    core.send(Command::OpenTitle {
+        meta_type: "movie".into(),
+        meta_id: "tt9".into(),
+    });
+    wait_for(&core, "details failed", |s| {
+        s.details
+            .as_ref()
+            .is_some_and(|d| d.meta_id == "tt9" && matches!(d.meta, Load::Failed(_)))
+    })
+    .await;
+
+    core.send(Command::AddToLibrary);
     core.send(Command::InstallAddon {
         url: "hello".into(),
     });

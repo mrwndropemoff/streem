@@ -20,7 +20,7 @@ pub(crate) fn item_to_add(state: &State) -> Option<LibraryItem> {
 }
 
 /// Replaces the library with what local storage now holds.
-pub(crate) fn set(state: &mut State, items: Vec<LibraryItem>) {
+pub(crate) fn replace(state: &mut State, items: Vec<LibraryItem>) {
     state.library = items;
     mark_details(state);
 }

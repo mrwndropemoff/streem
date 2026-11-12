@@ -117,9 +117,13 @@ enum StoreJob {
     Load,
     Upsert { url: String, manifest_json: String },
     Remove { url: String },
-    LoadLibrary,
-    AddToLibrary(LibraryItem),
-    RemoveFromLibrary { meta_id: String },
+    Library(LibraryJob),
+}
+
+enum LibraryJob {
+    Load,
+    Add(LibraryItem),
+    Remove { meta_id: String },
 }
 
 pub(crate) struct App {
@@ -142,7 +146,7 @@ impl App {
             self.sender.clone(),
         ));
         let _ = jobs.send(StoreJob::Load);
-        let _ = jobs.send(StoreJob::LoadLibrary);
+        let _ = jobs.send(StoreJob::Library(LibraryJob::Load));
 
         let client = http_client();
         let mut state = State::default();
@@ -402,7 +406,7 @@ impl App {
                     }
                 }
                 Message::Stored(Ok(StoreOutput::Library(items))) => {
-                    library::set(&mut state, items);
+                    library::replace(&mut state, items);
                 }
                 Message::Stored(Ok(StoreOutput::Addons(output))) => {
                     state.addons = output.addons;
@@ -490,13 +494,14 @@ impl App {
 }
 
 /// The disk job for a library command, or `None` when it is ignored: adding with no ready
-/// details.
+/// details. Shared by the main loop and the shutdown drain, so both ignore the same commands.
 fn library_job(state: &State, command: Command) -> Option<StoreJob> {
-    match command {
-        Command::AddToLibrary => library::item_to_add(state).map(StoreJob::AddToLibrary),
-        Command::RemoveFromLibrary { meta_id } => Some(StoreJob::RemoveFromLibrary { meta_id }),
-        _ => None,
-    }
+    let job = match command {
+        Command::AddToLibrary => LibraryJob::Add(library::item_to_add(state)?),
+        Command::RemoveFromLibrary { meta_id } => LibraryJob::Remove { meta_id },
+        _ => return None,
+    };
+    Some(StoreJob::Library(job))
 }
 
 fn notice(next_id: &mut u64, text: String) -> Notice {
@@ -758,21 +763,23 @@ async fn store_worker(
     }
 }
 
+/// Writes the library change, if any, then reads the whole library back.
+fn run_library_job(store: &Store, job: LibraryJob) -> Result<StoreOutput, StoreError> {
+    match job {
+        LibraryJob::Load => {}
+        LibraryJob::Add(item) => store.add_to_library(&item)?,
+        LibraryJob::Remove { meta_id } => store.remove_from_library(&meta_id)?,
+    }
+    Ok(StoreOutput::Library(store.list_library()?))
+}
+
 fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
     let mut first_launch = false;
     match job {
         StoreJob::Load => first_launch = store.has_no_addon_rows()?,
         StoreJob::Upsert { url, manifest_json } => store.upsert_addon(&url, &manifest_json)?,
         StoreJob::Remove { url } => store.remove_addon(&url)?,
-        StoreJob::LoadLibrary => return Ok(StoreOutput::Library(store.list_library()?)),
-        StoreJob::AddToLibrary(item) => {
-            store.add_to_library(&item)?;
-            return Ok(StoreOutput::Library(store.list_library()?));
-        }
-        StoreJob::RemoveFromLibrary { meta_id } => {
-            store.remove_from_library(&meta_id)?;
-            return Ok(StoreOutput::Library(store.list_library()?));
-        }
+        StoreJob::Library(job) => return run_library_job(store, job),
     }
     let mut addons = Vec::new();
     let mut catalogs = Vec::new();
