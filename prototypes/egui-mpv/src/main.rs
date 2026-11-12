@@ -22,7 +22,6 @@ struct Track {
 struct App {
     mpv: &'static Mpv,
     render: Arc<GlRender>,
-    fullscreen: bool,
 }
 
 fn get_proc_address(f: &Arc<dyn Fn(&std::ffi::CStr) -> *const std::ffi::c_void + Send + Sync>, name: &str) -> *mut std::ffi::c_void {
@@ -60,7 +59,7 @@ impl App {
             let s = |p: &str| mpv.get_property::<String>(p).unwrap_or_else(|_| "n/a".into());
             println!("time-pos={t:.1} paused={} aid={} sid={}", s("pause") == "yes", s("aid"), s("sid"));
         });
-        Self { mpv, render: Arc::new(GlRender(ctx)), fullscreen: false }
+        Self { mpv, render: Arc::new(GlRender(ctx)) }
     }
 
     /// shortcut: re-read the track list every frame; fine for a handful of tracks, cache on file-loaded if it ever shows up in a profile.
@@ -129,7 +128,7 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     let paused = self.mpv.get_property::<String>("pause").is_ok_and(|p| p == "yes");
                     if ui.button(if paused { "Play" } else { "Pause" }).clicked() {
-                        let _ = self.mpv.set_property("pause", !paused);
+                        let _ = self.mpv.command("cycle", &["pause"]); // atomic, unlike read-then-set
                     }
                     let dur = self.mpv.get_property::<f64>("duration").unwrap_or(0.0);
                     let mut pos = self.mpv.get_property::<f64>("time-pos").unwrap_or(0.0);
@@ -144,13 +143,13 @@ impl eframe::App for App {
             });
         });
 
-        if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
-            let paused = self.mpv.get_property::<String>("pause").is_ok_and(|p| p == "yes");
-            let _ = self.mpv.set_property("pause", !paused);
+        // Only when no widget has focus, or a focused button would toggle twice.
+        if ctx.input(|i| i.key_pressed(egui::Key::Space)) && ctx.memory(|m| m.focused().is_none()) {
+            let _ = self.mpv.command("cycle", &["pause"]);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::F)) {
-            self.fullscreen = !self.fullscreen;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+            let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)); // real state, so a WM exit can't desync it
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
         }
     }
 }
