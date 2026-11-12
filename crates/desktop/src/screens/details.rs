@@ -67,7 +67,7 @@ impl DetailsScreen {
 
     /// Called when the person leaves this screen, so that opening the same movie again asks
     /// for its streams again.
-    pub fn left(&mut self) {
+    pub fn on_leave(&mut self) {
         self.movie_streams_asked = false;
     }
 

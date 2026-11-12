@@ -40,7 +40,7 @@ impl App {
     /// Leaves the details screen for `screen` and tells the core the title is closed.
     fn leave_details(&mut self, screen: Screen) {
         self.core.send(Command::CloseTitle);
-        self.details.left();
+        self.details.on_leave();
         self.screen = screen;
     }
 }

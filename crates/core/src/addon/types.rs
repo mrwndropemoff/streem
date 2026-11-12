@@ -212,10 +212,7 @@ pub enum StreamSource {
     /// A link, of any scheme.
     Url(String),
     /// A torrent, which the app does not play: it has no torrent engine.
-    Torrent {
-        info_hash: String,
-        file_idx: Option<u32>,
-    },
+    Torrent,
     /// Anything else, such as `ytId` or `externalUrl`.
     Other,
 }
@@ -234,8 +231,6 @@ struct RawStream {
     url: Option<String>,
     #[serde(default, deserialize_with = "text_or_number")]
     info_hash: Option<String>,
-    #[serde(default, deserialize_with = "number_or_text")]
-    file_idx: Option<u32>,
     #[serde(default)]
     behavior_hints: Option<serde_json::Value>,
 }
@@ -251,10 +246,7 @@ impl From<RawStream> for Stream {
         let filename = hinted_filename.or_else(|| raw.url.as_deref().and_then(filename_in_url));
         let source = match (raw.url, raw.info_hash) {
             (Some(url), _) => StreamSource::Url(url),
-            (None, Some(info_hash)) => StreamSource::Torrent {
-                info_hash,
-                file_idx: raw.file_idx,
-            },
+            (None, Some(_)) => StreamSource::Torrent,
             (None, None) => StreamSource::Other,
         };
         Stream {

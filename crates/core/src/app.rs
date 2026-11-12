@@ -119,7 +119,7 @@ impl App {
         let mut details_generation = 0;
         // The **addon** URL of each stream group, in the same order as the groups, and which
         // stream request the running fetches belong to.
-        let mut stream_sources: Vec<String> = Vec::new();
+        let mut stream_addon_urls: Vec<String> = Vec::new();
         let mut streams_generation = 0;
 
         loop {
@@ -159,7 +159,7 @@ impl App {
                 Message::Command(Command::OpenTitle { meta_type, meta_id }) => {
                     details_generation += 1;
                     streams_generation += 1;
-                    stream_sources.clear();
+                    stream_addon_urls.clear();
                     let meta = start_meta(
                         &client,
                         &self.sender,
@@ -178,7 +178,7 @@ impl App {
                 Message::Command(Command::CloseTitle) => {
                     details_generation += 1;
                     streams_generation += 1;
-                    stream_sources.clear();
+                    stream_addon_urls.clear();
                     state.details = None;
                 }
                 Message::Command(Command::LoadStreams { video_id }) => {
@@ -192,7 +192,7 @@ impl App {
                             video_id,
                             streams_generation,
                         );
-                        stream_sources = sources;
+                        stream_addon_urls = sources;
                         details.streams = Some(list);
                     }
                 }
@@ -206,12 +206,13 @@ impl App {
                             .details
                             .as_mut()
                             .and_then(|details| details.streams.as_mut())
-                        && let Some(index) = stream_sources.iter().position(|url| *url == addon_url)
+                        && let Some(index) =
+                            stream_addon_urls.iter().position(|url| *url == addon_url)
                     {
                         match result {
                             Ok(streams) if streams.is_empty() => {
                                 list.groups.remove(index);
-                                stream_sources.remove(index);
+                                stream_addon_urls.remove(index);
                             }
                             Ok(streams) => {
                                 list.groups[index].streams =
@@ -461,7 +462,7 @@ fn start_streams(
 fn stream_item(stream: Stream) -> StreamItem {
     let unplayable_reason = match &stream.source {
         StreamSource::Url(url) if is_http(url) => None,
-        StreamSource::Torrent { .. } => Some("Torrent streams are not supported"),
+        StreamSource::Torrent => Some("Torrent streams are not supported"),
         StreamSource::Url(_) | StreamSource::Other => Some("This kind of stream is not supported"),
     };
     StreamItem {
