@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use super::types::{Manifest, MetaPreview};
+use super::types::{Manifest, Meta, MetaPreview, Video};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AddonError {
@@ -18,6 +18,8 @@ pub enum AddonError {
     InvalidManifest(#[from] serde_json::Error),
     #[error("the addon's catalog is not valid: {0}")]
     InvalidCatalog(serde_json::Error),
+    #[error("the addon's description of the title is not valid: {0}")]
+    InvalidMeta(serde_json::Error),
 }
 
 /// Turns what the user typed into the URL that identifies the **addon**.
@@ -110,6 +112,60 @@ pub async fn fetch_catalog(
         .into_iter()
         .filter_map(|meta| serde_json::from_value(meta).ok())
         .collect())
+}
+
+/// The URL of a meta request: `{base}/meta/{type}/{id}.json`. `{type}` and `{id}` are
+/// percent-encoded.
+pub fn meta_url(manifest_url: &str, meta_type: &str, meta_id: &str) -> Result<String, AddonError> {
+    let mut url = reqwest::Url::parse(manifest_url)
+        .map_err(|_| AddonError::InvalidUrl(manifest_url.into()))?;
+    url.set_query(None);
+    url.set_fragment(None);
+    url.path_segments_mut()
+        .map_err(|()| AddonError::InvalidUrl(manifest_url.into()))?
+        .pop()
+        .push("meta")
+        .push(meta_type)
+        .push(&format!("{meta_id}.json"));
+    Ok(url.into())
+}
+
+/// Downloads the description of one title. A movie that comes back with no videos gets one
+/// whose id is the meta id, so there is always something to play.
+pub async fn fetch_meta(
+    client: &reqwest::Client,
+    url: &str,
+    meta_type: &str,
+    meta_id: &str,
+) -> Result<Meta, AddonError> {
+    #[derive(serde::Deserialize)]
+    struct Response {
+        meta: Meta,
+    }
+
+    let response = client.get(url).send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(AddonError::Status(status.as_u16()));
+    }
+    let text = response.text().await?;
+    let Response { mut meta } = serde_json::from_str(&text).map_err(AddonError::InvalidMeta)?;
+    if meta.id.is_empty() {
+        meta.id = meta_id.to_string();
+    }
+    if meta.meta_type.is_empty() {
+        meta.meta_type = meta_type.to_string();
+    }
+    if meta.meta_type == "movie" && meta.videos.is_empty() {
+        meta.videos.push(Video {
+            id: meta.id.clone(),
+            title: meta.name.clone(),
+            season: None,
+            episode: None,
+            released: None,
+        });
+    }
+    Ok(meta)
 }
 
 #[cfg(test)]

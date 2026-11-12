@@ -2,7 +2,7 @@
 
 A Stremio-like media centre for family and friends. It installs **addons** (remote services that speak the Stremio addon protocol), browses their catalogs and plays their streams. Planned differences from Stremio: several **profiles** under one **account**, everything synced over the internet, and **watch parties**.
 
-> **Status: early development.** Today the desktop app has two screens: Home, which shows one row of posters for each catalog offered by your installed addons, and Addons, where you install an addon from a URL, list installed addons, and remove them. Opening a title, playback, search, sync, profiles and watch parties are planned but not built yet (see [Roadmap](#roadmap)).
+> **Status: early development.** Today the desktop app has three screens: Home, which shows one row of posters for each catalog offered by your installed addons; Details, opened by clicking a poster, which shows a title's artwork, description, year, rating and genres (and, for a series, a season picker with its episodes); and Addons, where you install an addon from a URL, list installed addons, and remove them. Streams, playback, search, sync, profiles and watch parties are planned but not built yet (see [Roadmap](#roadmap)).
 
 Target platforms: Linux (Wayland) and Windows. It is written entirely in Rust.
 
@@ -141,14 +141,14 @@ No UI code. Dependencies include `reqwest` (HTTP), `rusqlite` (bundled SQLite), 
 
 | File | What it does |
 |---|---|
-| `src/lib.rs` | The public face of the crate. Defines `Core` (the running engine), `Command` (what the UI can ask for: `InstallAddon`, `RemoveAddon`, `DismissNotice`, `LoadHome`), `State` (everything the UI draws: the addon list, the Home catalog rows and an optional notice) and `Notice` (a message for the user). `Core::poster` hands the UI a decoded poster once it is ready. `Core::start` launches the background thread and installs Cinemeta on first launch; dropping `Core` stops it cleanly, after saving pending work. |
+| `src/lib.rs` | The public face of the crate. Defines `Core` (the running engine), `Command` (what the UI can ask for: `InstallAddon`, `RemoveAddon`, `DismissNotice`, `LoadHome`, `OpenTitle`, `CloseTitle`), `State` (everything the UI draws: the addon list, the Home catalog rows, the opened title's `Details` and an optional notice) and `Notice` (a message for the user). `Core::poster` hands the UI a decoded poster once it is ready. `Core::start` launches the background thread and installs Cinemeta on first launch; dropping `Core` stops it cleanly, after saving pending work. |
 | `src/app.rs` | The single background task that owns the mutable state. It receives commands and the results of its own network/disk jobs as messages, updates `State`, publishes it, and calls the UI's `on_change` callback. It never blocks on network or disk, and handles edge cases such as cancelling an install when the addon is removed mid-download. |
 | `src/posters.rs` | Poster images. Downloads each image once, saves the original bytes under `<data folder>/posters/`, decodes and scales it to at most 300 pixels wide on a blocking task, and keeps the result in memory. A saved poster is never downloaded again, in this run or a later one. |
 | `src/store.rs` | Local SQLite storage in `streem.db`. Opens the file, runs numbered migrations (append new ones, never edit old ones), and saves, loads and removes addon rows. Columns such as `deleted`, `dirty` and `updated_at` are already there for the future sync feature. |
 | `src/addon/mod.rs` | Declares the `addon` module's two submodules. |
-| `src/addon/types.rs` | Rust types for the Stremio addon manifest (name, version, resources, catalogs and their `extra` options, catalog entries). Only the fields the app uses are read; unknown fields are ignored. Shapes follow `stremio-core` (MIT). |
-| `src/addon/client.rs` | Talks to addons over HTTP: turns `stremio://` links into `https://`, rejects URLs that are not `manifest.json` links, downloads the manifest and parses it, and fetches the first page of a catalog (`/catalog/<type>/<id>.json`). |
-| `tests/core.rs` | Black-box tests of `Core`: send commands, check the resulting `State`. Uses a mock web server and temporary folders. Covers the Home rows and posters too. |
+| `src/addon/types.rs` | Rust types for the Stremio addon manifest (name, version, resources, catalogs and their `extra` options, catalog entries). Only the fields the app uses are read; unknown fields are ignored. A title's description (`Meta`) and episodes (`Video`) are read leniently: an odd optional field, such as a `season` sent as text, never drops an episode, and only an entry with no `id` is skipped. Shapes follow `stremio-core` (MIT). |
+| `src/addon/client.rs` | Talks to addons over HTTP: turns `stremio://` links into `https://`, rejects URLs that are not `manifest.json` links, downloads the manifest and parses it, fetches the first page of a catalog (`/catalog/<type>/<id>.json`), and fetches a title's details (`/meta/<type>/<id>.json`). |
+| `tests/core.rs` | Black-box tests of `Core`: send commands, check the resulting `State`. Uses a mock web server and temporary folders. Covers the Home rows, posters and title details too (movie, series, which **addon** is asked, no matching **addon**, closing a title). |
 
 ### `crates/desktop` — the window (`streem-desktop`)
 
@@ -156,9 +156,10 @@ Built with [egui](https://github.com/emilk/egui) through `eframe`, using the Ope
 
 | File | What it does |
 |---|---|
-| `src/main.rs` | Program entry point. Opens the "Streem" window, starts `Core` (pointing it at the data folder, or `STREEM_DATA_DIR`), and each frame draws the notice banner, a Home/Addons top bar and the chosen screen from the latest `State`. |
-| `src/screens/mod.rs` | Groups the screens and holds shared UI pieces, such as the dismissible red notice banner at the top of the window. |
-| `src/screens/home.rs` | The Home screen: a vertical list of catalog rows, each a title and a horizontal strip of posters with names. It asks `Core` for a poster only when its cell is on screen, draws a grey placeholder until it arrives, and keeps one egui texture per poster URL. Loading rows show placeholders and failed rows show their message. |
+| `src/main.rs` | Program entry point. Opens the "Streem" window, starts `Core` (pointing it at the data folder, or `STREEM_DATA_DIR`), and each frame draws the notice banner, a Home/Addons top bar and the chosen screen (Home, Addons or Details) from the latest `State`. Opening a title from Home sends `OpenTitle` and shows Details; Back, or clicking a top-bar tab, sends `CloseTitle`. |
+| `src/screens/mod.rs` | Groups the screens and holds shared UI pieces, such as the dismissible red notice banner at the top of the window and `Textures`, which turns each poster or background image from `Core` into one egui texture and keeps it for later frames. |
+| `src/screens/home.rs` | The Home screen: a vertical list of catalog rows, each a title and a horizontal strip of posters with names. It asks `Core` for a poster only when its cell is on screen, draws a grey placeholder until it arrives, and returns the title the person clicked so `main.rs` can open it. Its scroll position is kept, so Back lands where you left. Loading rows show placeholders and failed rows show their message. |
+| `src/screens/details.rs` | The Details screen: a Back button, then the dimmed background image, poster, name, year, rating, genres and description of the opened title. For a series it adds a season dropdown (seasons ascending, season 0 last as "Specials") and that season's episodes as "E3 · Title"; clicking an episode does nothing yet. Shows a placeholder while loading and the message if the request failed. |
 | `src/screens/addons.rs` | The Addons screen: the URL field and **Install** button, the scrolling list of installed addons (name, version, description), and a **Remove** button on each. It only sends `Command`s; it never does I/O itself. |
 
 ### `prototypes/egui-mpv` — throwaway experiment
@@ -198,14 +199,14 @@ cargo run --release -- sample/sample.mkv
 | File | What it does |
 |---|---|
 | `spec.md` | The v1 specification: what the app is, key decisions, the two-crate rule, accounts/profiles/overrides, Real-Debrid via addons, sync, watch parties, build order and open risks. **Read this first** to understand where the project is going. |
-| `issues/01` … `issues/22` | One ticket per piece of work, each with a `Status:` line (e.g. `ready-for-agent`, `ready-for-human`). Tickets 01 to 04 have been worked on (their `Status:` lines may lag behind the code); the rest are the backlog. |
+| `issues/01` … `issues/22` | One ticket per piece of work, each with a `Status:` line (e.g. `ready-for-agent`, `ready-for-human`). Tickets 01 to 05 have been worked on (their `Status:` lines may lag behind the code); the rest are the backlog. |
 
 ## Roadmap
 
 From the spec, in build order (v1 is steps 1 to 5):
 
 1. **Prototype:** egui plays video through libmpv. *Done: egui was chosen.*
-2. **Browse and play:** workspace and addon install *(done)*, catalogs on the Home screen *(done)*, then title details, stream list, playback, search, subtitles. *In progress.*
+2. **Browse and play:** workspace and addon install *(done)*, catalogs on the Home screen *(done)*, title details *(done)*, then stream list, playback, search, subtitles. *In progress.*
 3. **Real-Debrid:** a `{real_debrid_key}` placeholder in addon URLs (Real-Debrid itself is handled by addons such as Torrentio; the app has no torrent engine).
 4. **Account and profiles:** sign-up/sign-in, profile picker, per-profile overrides, history, continue-watching and library, all synced through Supabase.
 5. **Watch party:** shared play/pause/seek between profiles of one account.

@@ -11,12 +11,13 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::addon::client::{
-    catalog_url, fetch_catalog, fetch_manifest, http_client, normalize_url, parse_manifest,
+    catalog_url, fetch_catalog, fetch_manifest, fetch_meta, http_client, meta_url, normalize_url,
+    parse_manifest,
 };
-use crate::addon::types::{ManifestCatalog, MetaPreview};
+use crate::addon::types::{Manifest, ManifestCatalog, Meta, MetaPreview};
 use crate::posters::{self, Poster, PosterCache};
 use crate::store::{Store, StoreError, StoredAddon};
-use crate::{CatalogRow, Command, InstalledAddon, Load, Notice, State};
+use crate::{CatalogRow, Command, Details, InstalledAddon, Load, Notice, State};
 
 /// What the task receives: the UI's commands, and results of work it started.
 pub(crate) enum Message {
@@ -37,6 +38,12 @@ pub(crate) enum Message {
         row: usize,
         result: Result<Vec<MetaPreview>, String>,
     },
+    /// The details of a title finished loading. Ignored when `generation` is not the latest one,
+    /// which means the title was closed or another one was opened since the request was made.
+    Meta {
+        generation: u64,
+        result: Result<Meta, String>,
+    },
 }
 
 /// The **addon** list as saved, after a disk job.
@@ -44,6 +51,9 @@ pub(crate) struct StoreOutput {
     addons: Vec<InstalledAddon>,
     /// The catalogs the home screen can show, from the saved manifests.
     catalogs: Vec<CatalogSource>,
+    /// The saved manifests, by **addon** URL, in **addon** order. Used to pick who answers a
+    /// meta request.
+    manifests: Vec<(String, Manifest)>,
     /// Set by the first load only: the data directory had no **addon** rows at all.
     first_launch: bool,
 }
@@ -93,6 +103,10 @@ impl App {
         // What the home rows were built from, and which build the running fetches belong to.
         let mut catalogs: Vec<CatalogSource> = Vec::new();
         let mut home_generation = 0;
+        // The manifests of the installed **addons**, and which open title the running fetch
+        // belongs to.
+        let mut manifests: Vec<(String, Manifest)> = Vec::new();
+        let mut details_generation = 0;
 
         loop {
             let message = tokio::select! {
@@ -128,6 +142,36 @@ impl App {
                         };
                     }
                 }
+                Message::Command(Command::OpenTitle { meta_type, meta_id }) => {
+                    details_generation += 1;
+                    let meta = start_meta(
+                        &client,
+                        &self.sender,
+                        &manifests,
+                        &meta_type,
+                        &meta_id,
+                        details_generation,
+                    );
+                    state.details = Some(Details {
+                        meta_type,
+                        meta_id,
+                        meta,
+                    });
+                }
+                Message::Command(Command::CloseTitle) => {
+                    details_generation += 1;
+                    state.details = None;
+                }
+                Message::Meta { generation, result } => {
+                    if generation == details_generation
+                        && let Some(details) = state.details.as_mut()
+                    {
+                        details.meta = match result {
+                            Ok(meta) => Load::Ready(meta),
+                            Err(text) => Load::Failed(text),
+                        };
+                    }
+                }
                 Message::Command(Command::RemoveAddon { url }) => {
                     downloading.retain(|_, downloading_url| *downloading_url != url);
                     let _ = jobs.send(StoreJob::Remove { url });
@@ -150,6 +194,7 @@ impl App {
                     state.addons = output.addons;
                     // Every finished disk job is a startup load, an install or a removal.
                     catalogs = output.catalogs;
+                    manifests = output.manifests;
                     reload_home = true;
                     if output.first_launch {
                         to_install.extend(self.default_addon_urls.iter().cloned());
@@ -272,6 +317,42 @@ fn start_home(
     rows
 }
 
+/// Picks the **addon** to ask about a title: the first installed one that offers `meta` for
+/// the type and id. Fetches in the background and returns `Loading`, or `Failed` when no
+/// **addon** matches.
+fn start_meta(
+    client: &reqwest::Client,
+    sender: &mpsc::UnboundedSender<Message>,
+    manifests: &[(String, Manifest)],
+    meta_type: &str,
+    meta_id: &str,
+    generation: u64,
+) -> Load<Meta> {
+    let Some((addon_url, _)) = manifests
+        .iter()
+        .find(|(_, manifest)| manifest.offers_meta(meta_type, meta_id))
+    else {
+        return Load::Failed(format!(
+            "No installed addon can describe {meta_type} {meta_id}."
+        ));
+    };
+
+    let client = client.clone();
+    let sender = sender.clone();
+    let addon_url = addon_url.clone();
+    let meta_type = meta_type.to_string();
+    let meta_id = meta_id.to_string();
+    tokio::spawn(async move {
+        let result = match meta_url(&addon_url, &meta_type, &meta_id) {
+            Ok(url) => fetch_meta(&client, &url, &meta_type, &meta_id).await,
+            Err(error) => Err(error),
+        };
+        let result = result.map_err(|error| error.to_string());
+        let _ = sender.send(Message::Meta { generation, result });
+    });
+    Load::Loading
+}
+
 /// Loads a poster in the background, then reports back.
 fn spawn_poster(
     client: &reqwest::Client,
@@ -326,38 +407,41 @@ fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
     }
     let mut addons = Vec::new();
     let mut catalogs = Vec::new();
+    let mut manifests = Vec::new();
     for stored in store.list_addons()? {
-        let Some((addon, offered)) = installed_addon(stored) else {
+        let Some((addon, manifest)) = installed_addon(stored) else {
             continue;
         };
-        for catalog in offered {
+        for catalog in &manifest.catalogs {
             if !catalog.has_required_extra() {
                 catalogs.push(CatalogSource {
                     addon_url: addon.url.clone(),
                     addon_name: addon.name.clone(),
-                    catalog,
+                    catalog: catalog.clone(),
                 });
             }
         }
+        manifests.push((addon.url.clone(), manifest));
         addons.push(addon);
     }
     Ok(StoreOutput {
         addons,
         catalogs,
+        manifests,
         first_launch,
     })
 }
 
 /// A saved row whose manifest can no longer be read is left out of the list.
-/// Returns the **addon** with the catalogs its manifest lists.
-fn installed_addon(stored: StoredAddon) -> Option<(InstalledAddon, Vec<ManifestCatalog>)> {
+/// Returns the **addon** with its manifest.
+fn installed_addon(stored: StoredAddon) -> Option<(InstalledAddon, Manifest)> {
     let manifest = parse_manifest(&stored.manifest_json).ok()?;
     let addon = InstalledAddon {
         url: stored.url,
-        id: manifest.id,
-        name: manifest.name,
-        version: manifest.version,
-        description: manifest.description.unwrap_or_default(),
+        id: manifest.id.clone(),
+        name: manifest.name.clone(),
+        version: manifest.version.clone(),
+        description: manifest.description.clone().unwrap_or_default(),
     };
-    Some((addon, manifest.catalogs))
+    Some((addon, manifest))
 }
