@@ -140,7 +140,7 @@ pub struct Meta {
     pub description: Option<String>,
     #[serde(default, rename = "releaseInfo")]
     pub release_info: Option<String>,
-    /// Addons send it as text (`"8.8"`) or as a number.
+    /// **Addons** send it as text (`"8.8"`) or as a number.
     #[serde(default, rename = "imdbRating", deserialize_with = "text_or_number")]
     pub rating: Option<String>,
     #[serde(default, deserialize_with = "lenient_list")]

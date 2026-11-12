@@ -317,7 +317,7 @@ async fn serve_addon(server: &MockServer, name: &str, catalogs: &str) -> String 
     format!("{}/{name}/manifest.json", server.uri())
 }
 
-async fn serve_catalog(server: &MockServer, request_path: &str, status: u16, body: &str) {
+async fn serve_json(server: &MockServer, request_path: &str, status: u16, body: &str) {
     Mock::given(method("GET"))
         .and(path(request_path))
         .respond_with(ResponseTemplate::new(status).set_body_string(body))
@@ -353,7 +353,7 @@ async fn two_catalogs_make_two_rows_that_go_from_loading_to_ready() {
         )
         .mount(&server)
         .await;
-    serve_catalog(
+    serve_json(
         &server,
         "/one/catalog/series/top.json",
         200,
@@ -398,14 +398,14 @@ async fn one_failing_addon_does_not_affect_the_other_rows() {
         r#"[{"type": "movie", "id": "top", "name": "Bad"}]"#,
     )
     .await;
-    serve_catalog(
+    serve_json(
         &server,
         "/good/catalog/movie/top.json",
         200,
         r#"{"metas": []}"#,
     )
     .await;
-    serve_catalog(&server, "/bad/catalog/movie/top.json", 500, "oops").await;
+    serve_json(&server, "/bad/catalog/movie/top.json", 500, "oops").await;
     let dir = tempfile::tempdir().unwrap();
     let core = start(dir.path());
     core.send(Command::InstallAddon { url: good });
@@ -446,7 +446,7 @@ async fn a_catalog_with_a_required_extra_makes_no_row() {
              "extra": [{"name": "search", "isRequired": true}]}]"#,
     )
     .await;
-    serve_catalog(
+    serve_json(
         &server,
         "/one/catalog/movie/top.json",
         200,
@@ -643,7 +643,7 @@ async fn opening_a_movie_goes_from_loading_to_ready_with_the_fields_filled() {
 async fn a_series_returns_its_videos_with_seasons_and_episodes() {
     let server = MockServer::start().await;
     let url = serve_meta_addon(&server, "one", r#""meta""#).await;
-    serve_catalog(
+    serve_json(
         &server,
         "/one/meta/series/tt2.json",
         200,
@@ -667,7 +667,7 @@ async fn a_series_returns_its_videos_with_seasons_and_episodes() {
     assert_eq!(pilot.title, "Pilot");
     assert_eq!((pilot.season, pilot.episode), (Some(1), Some(1)));
     assert_eq!(pilot.released.as_deref(), Some("2011-04-17T00:00:00.000Z"));
-    // Older addons call the title `name`.
+    // Older **addons** call the title `name`.
     assert_eq!(meta.videos[1].title, "Behind the scenes");
     assert_eq!(meta.videos[1].season, Some(0));
     assert_eq!(meta.videos[2].episode, Some(3));
@@ -689,7 +689,7 @@ async fn the_addon_whose_id_prefix_matches_is_the_one_asked() {
     )
     .await;
     for name in ["one", "two"] {
-        serve_catalog(
+        serve_json(
             &server,
             &format!("/{name}/meta/movie/kitsu:7.json"),
             200,
@@ -742,7 +742,7 @@ async fn no_matching_addon_gives_failed() {
 async fn a_failing_request_gives_failed() {
     let server = MockServer::start().await;
     let url = serve_meta_addon(&server, "one", r#""meta""#).await;
-    serve_catalog(&server, "/one/meta/movie/tt1.json", 500, "oops").await;
+    serve_json(&server, "/one/meta/movie/tt1.json", 500, "oops").await;
     let dir = tempfile::tempdir().unwrap();
     let core = start(dir.path());
     install(&core, url, 1).await;
@@ -763,7 +763,7 @@ async fn a_failing_request_gives_failed() {
 async fn closing_the_title_clears_the_details() {
     let server = MockServer::start().await;
     let url = serve_meta_addon(&server, "one", r#""meta""#).await;
-    serve_catalog(
+    serve_json(
         &server,
         "/one/meta/movie/tt1.json",
         200,
