@@ -96,9 +96,9 @@ fn resource_url(
     let mut url = String::from(url);
     if let Some((name, value)) = extra {
         url.push('/');
-        url.extend(utf8_percent_encode(name, EXTRA_VALUE));
+        url.extend(utf8_percent_encode(name, EXTRA_ENCODE_SET));
         url.push('=');
-        url.extend(utf8_percent_encode(value, EXTRA_VALUE));
+        url.extend(utf8_percent_encode(value, EXTRA_ENCODE_SET));
     }
     url.push_str(".json");
     Ok(url)
@@ -106,7 +106,7 @@ fn resource_url(
 
 /// What stays unencoded in an extra: the characters JavaScript's `encodeURIComponent` leaves
 /// alone, which is what Stremio itself sends.
-const EXTRA_VALUE: &AsciiSet = &NON_ALPHANUMERIC
+const EXTRA_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
     .remove(b'.')

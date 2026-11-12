@@ -1680,16 +1680,31 @@ async fn the_query_is_sent_percent_encoded() {
         r#"{"metas": [{"id": "tt2", "type": "movie", "name": "The Wire"}]}"#,
     )
     .await;
+    // Left raw, `&` and `/` would change the request, so this one fails unless it is encoded.
+    serve_json(
+        &server,
+        "/one/catalog/movie/find/search=law%20%26%20order%2Fsvu.json",
+        200,
+        r#"{"metas": [{"id": "tt3", "type": "series", "name": "Law & Order: SVU"}]}"#,
+    )
+    .await;
     let dir = tempfile::tempdir().unwrap();
     let core = start(dir.path());
     install(&core, url, 1).await;
 
-    let state = search(&core, "the wire").await;
+    for query in ["the wire", "law & order/svu"] {
+        let state = search(&core, query).await;
 
-    let rows = &state.search.as_ref().unwrap().rows;
+        let rows = &state.search.as_ref().unwrap().rows;
+        assert!(
+            matches!(&rows[0].items, Load::Ready(items) if items.len() == 1),
+            "{query}: {rows:?}"
+        );
+    }
+    let searched: Vec<String> = catalog_requests(&server).await;
     assert!(
-        matches!(&rows[0].items, Load::Ready(items) if items.len() == 1),
-        "{rows:?}"
+        searched.contains(&"/one/catalog/movie/find/search=the%20wire.json".to_string()),
+        "{searched:?}"
     );
 }
 
@@ -1764,12 +1779,14 @@ async fn an_empty_query_clears_the_search() {
     let dir = tempfile::tempdir().unwrap();
     let core = start(dir.path());
     install(&core, url, 1).await;
-    search(&core, "matrix").await;
+    for empty in ["", "   "] {
+        search(&core, "matrix").await;
 
-    core.send(Command::Search {
-        query: "   ".into(),
-    });
-    wait_for(&core, "search cleared", |s| s.search.is_none()).await;
+        core.send(Command::Search {
+            query: empty.into(),
+        });
+        wait_for(&core, "search cleared", |s| s.search.is_none()).await;
+    }
 }
 
 #[tokio::test]

@@ -4,7 +4,7 @@
 //! [`super::catalog_row`]. A row that came back with no results is not shown.
 
 use eframe::egui;
-use streem_core::{Core, Load, MetaPreview, State};
+use streem_core::{CatalogRow, Core, Load, MetaPreview, State};
 
 use super::Textures;
 
@@ -26,15 +26,11 @@ impl SearchScreen {
             .id_salt(("search", &search.query))
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let no_results = search
-                    .rows
-                    .iter()
-                    .all(|row| matches!(&row.items, Load::Ready(items) if items.is_empty()));
-                if no_results {
+                if search.rows.iter().all(found_nothing) {
                     ui.label("No results");
                 }
                 for (index, row) in search.rows.iter().enumerate() {
-                    if matches!(&row.items, Load::Ready(items) if items.is_empty()) {
+                    if found_nothing(row) {
                         continue;
                     }
                     let id_salt = ("search-row", &search.query, index);
@@ -48,4 +44,9 @@ impl SearchScreen {
             });
         opened
     }
+}
+
+/// The row finished loading with zero results.
+fn found_nothing(row: &CatalogRow) -> bool {
+    matches!(&row.items, Load::Ready(items) if items.is_empty())
 }

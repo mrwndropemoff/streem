@@ -38,6 +38,7 @@ pub enum Command {
     Search {
         query: String,
     },
+    /// Forgets the latest search; results still on their way are ignored.
     ClearSearch,
     /// Opens the details of a title. Asks the first installed **addon** that offers `meta`
     /// for this type and id.
