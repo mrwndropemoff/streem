@@ -93,9 +93,18 @@ Preferred languages (ticket 12), subtitle styling, subtitle delay.
   - The bar stays visible while a menu is open.
   - `main.rs` is not in the Files list, but its `PlayerScreen::ui` call had to change: it passes the `MpvView` instead of a paint closure.
 - **Known and left alone, after a two-axis review:**
-  - If a `sub-add` is already under way when a new file loads, it can still land on the new file.
   - If `Core` replaced `playback` with one that has the same link without a stop in between, `mpv_view` would miss the first new tracks. The person cannot do this by hand.
   - The menus re-read mpv's track list every frame while the bar is visible: about 6 property reads per track.
   - `fetch_subtitles` repeats the shape of `fetch_streams`.
 
   The review led to these changes: a wrong comment on `Message::Subtitles` was corrected, `file_serial` was renamed to `file_generation` and `AddSubtitle` to `SubtitleJob`, and the track menus return a `Pick` enum instead of `Option<Option<i64>>`. After those changes fmt, clippy and the workspace tests passed again; the desktop run above was done before them.
+- **Checked after a second review: a `sub-add` still downloading when a new file loads does not land on it.** The review suspected it could, and the new file's menu would then list it as an embedded track.
+
+  How it was checked, by the agent on Windows 11:
+  - A throwaway Node **addon** (not committed) served the sample as two streams, A and B. The first subtitles answer pointed at an `.srt` that took 8 s to answer; later answers pointed at a fast one.
+  - A temporary driver in `main.rs`, removed afterwards, played A, then B about 4 s later, logging `MpvView::tracks` once a second.
+  - It was run both with `StopPlayback` before the second `Play` and with `Play` replacing A directly.
+
+  In both runs B's subtitle was requested about 3 s before A's slow `.srt` was answered. The worker runs one job at a time, so mpv had already abandoned A's `sub-add` when the file changed. B's menu read `eng`, `bbb · Repro` until the end, and A's subtitle never appeared.
+
+  A fix that removed such a track after the fact made no visible difference in the same runs, so it was not kept. One gap is left: the worker could check the generation, a new file could load, and only then would mpv start the `sub-add`. That gap is tiny and was not seen.
