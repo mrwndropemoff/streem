@@ -7,7 +7,7 @@ mod screens;
 use std::path::PathBuf;
 
 use eframe::egui;
-use streem_core::{Command, Core, MetaPreview, PlaybackReport, State};
+use streem_core::{Command, Core, PlaybackReport, State};
 
 use mpv_view::MpvView;
 
@@ -15,6 +15,8 @@ use mpv_view::MpvView;
 enum Screen {
     Home,
     Addons,
+    /// The titles in `State.library`.
+    Library,
     /// The results in `State.search`.
     Search,
     /// The title in `State.details`. Back goes to `App::details_from`.
@@ -24,11 +26,12 @@ enum Screen {
 struct App {
     core: Core,
     screen: Screen,
-    /// The screen the open title was opened from: Home or Search.
+    /// The screen the open title was opened from: Home, Library or Search.
     details_from: Screen,
     /// What is typed in the search box.
     search_text: String,
     home: screens::home::HomeScreen,
+    library: screens::library::LibraryScreen,
     search: screens::search::SearchScreen,
     addons: screens::addons::AddonsScreen,
     details: screens::details::DetailsScreen,
@@ -56,6 +59,7 @@ impl App {
             details_from: Screen::Home,
             search_text: String::new(),
             home: Default::default(),
+            library: Default::default(),
             search: Default::default(),
             addons: Default::default(),
             details: Default::default(),
@@ -110,11 +114,8 @@ impl App {
     }
 
     /// Opens the details of a title whose poster was clicked on the current screen.
-    fn open_title(&mut self, item: MetaPreview) {
-        self.core.send(Command::OpenTitle {
-            meta_type: item.meta_type,
-            meta_id: item.id,
-        });
+    fn open_title(&mut self, meta_type: String, meta_id: String) {
+        self.core.send(Command::OpenTitle { meta_type, meta_id });
         self.details_from = self.screen;
         self.screen = Screen::Details;
     }
@@ -147,6 +148,7 @@ impl eframe::App for App {
         egui::Panel::top("navigation").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.screen, Screen::Home, "Home");
+                ui.selectable_value(&mut self.screen, Screen::Library, "Library");
                 ui.selectable_value(&mut self.screen, Screen::Addons, "Addons");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let response = ui.add(
@@ -170,12 +172,17 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| match self.screen {
             Screen::Home => {
                 if let Some(item) = self.home.ui(ui, &state, &self.core) {
-                    self.open_title(item);
+                    self.open_title(item.meta_type, item.id);
+                }
+            }
+            Screen::Library => {
+                if let Some(item) = self.library.ui(ui, &state, &self.core) {
+                    self.open_title(item.meta_type, item.meta_id);
                 }
             }
             Screen::Search => {
                 if let Some(item) = self.search.ui(ui, &state, &self.core) {
-                    self.open_title(item);
+                    self.open_title(item.meta_type, item.id);
                 }
             }
             Screen::Addons => self.addons.ui(ui, &state, &self.core),
