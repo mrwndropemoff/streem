@@ -84,6 +84,20 @@ Each step is usable before the next one starts. v1 is steps 1 to 5.
 4. **Account and profiles.** Sign-up, sign-in, profile picker, **overrides**, watch history, continue-watching, library, all synced.
 5. **Watch party.**
 
+## Testing decisions
+
+- **One seam: `streem-core`'s public interface.** A test sends `Command`s to `Core` and asserts on the `State` it hands back. `streem-desktop` is not unit tested; its acceptance checks are run by hand (`cargo run -p streem-desktop`) and its only automated check is that it contains no network or disk code.
+- **Test behaviour, not internals.** Assert on `State` and on requests received by the fake server. Never on private functions, SQL, or task structure.
+- **The network is faked with `wiremock`.** Addons and Supabase (REST and Realtime) are both stood in for by a local `wiremock` server. Local storage uses a `tempfile` data directory, and "restart" means building a new `Core` on the same directory.
+- **Real services are `#[ignore]` tests.** Anything needing the internet (for example installing the real Cinemeta manifest) is marked `#[ignore]` and run with `cargo test -p streem-core -- --ignored`.
+- **Prior art:** `crates/core/tests/core.rs` (ticket 03). New tests follow its shape.
+- **Not automated:** mpv playback and the two-device sync and watch-party behaviour are checked by hand, using two copies of the app with different `STREEM_DATA_DIR` values, as the tickets' acceptance checks describe.
+- Each ticket's "Acceptance checks" list is the test list for that ticket. Do not widen it.
+
+## Out of scope for v1
+
+See "After v1" and "Not planned" below. Also out of scope: any UI test framework, and any Real-Debrid API client in the app.
+
 ## After v1
 
 **Downloads** and offline mode, "because you watched X" rows built from TMDB (the first feature that needs a TMDB key in the app), profile PINs, Android.
