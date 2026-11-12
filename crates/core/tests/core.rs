@@ -204,6 +204,39 @@ async fn a_removal_survives_a_restart() {
 }
 
 #[tokio::test]
+async fn a_command_sent_just_before_dropping_core_is_still_saved() {
+    let server = MockServer::start().await;
+    for name in ["one", "two"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}/manifest.json")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MANIFEST))
+            .mount(&server)
+            .await;
+    }
+    let one = format!("{}/one/manifest.json", server.uri());
+    let two = format!("{}/two/manifest.json", server.uri());
+
+    // Timing decides whether a lost write shows up, so try many times.
+    for round in 0..25 {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let core = start(dir.path());
+            core.send(Command::InstallAddon { url: one.clone() });
+            wait_for(&core, "installed", |s| s.addons.len() == 1).await;
+            core.send(Command::RemoveAddon { url: one.clone() });
+        } // dropped straight after sending
+
+        // Installing a second addon proves the saved list was loaded first (the disk worker
+        // runs jobs in order), so the first addon being gone means its removal was saved.
+        let core = start(dir.path());
+        core.send(Command::InstallAddon { url: two.clone() });
+        let state = wait_for(&core, "second addon", |s| !s.addons.is_empty()).await;
+        let urls: Vec<_> = state.addons.iter().map(|a| a.url.as_str()).collect();
+        assert_eq!(urls, [two.as_str()], "round {round}");
+    }
+}
+
+#[tokio::test]
 async fn first_launch_installs_the_default_addons_once() {
     let server = serve(MANIFEST, "/one/manifest.json").await;
     let url = format!("{}/one/manifest.json", server.uri());

@@ -50,7 +50,7 @@ pub(crate) struct App {
 impl App {
     pub(crate) async fn run(mut self) {
         let (jobs, job_inbox) = mpsc::unbounded_channel();
-        tokio::spawn(store_worker(
+        let worker = tokio::spawn(store_worker(
             self.data_dir.clone(),
             job_inbox,
             self.sender.clone(),
@@ -127,6 +127,26 @@ impl App {
                 (self.on_change)();
             }
         }
+
+        // Shutting down. Keep what the person already asked for: removals and downloaded
+        // manifests still waiting in the inbox become disk jobs, then wait for the disk
+        // worker to finish every queued job. Downloads still in progress are given up.
+        while let Ok(message) = self.inbox.try_recv() {
+            match message {
+                Message::Command(Command::RemoveAddon { url }) => {
+                    downloading.retain(|_, downloading_url| *downloading_url != url);
+                    let _ = jobs.send(StoreJob::Remove { url });
+                }
+                Message::Fetched(id, Ok(manifest_json)) => {
+                    if let Some(url) = downloading.remove(&id) {
+                        let _ = jobs.send(StoreJob::Upsert { url, manifest_json });
+                    }
+                }
+                _ => {}
+            }
+        }
+        drop(jobs);
+        let _ = worker.await;
     }
 }
 
