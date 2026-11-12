@@ -2,12 +2,15 @@
 //!
 //! Everything here is drawing and commands. The controls send `SetPaused`, `Seek` and
 //! `StopPlayback` to `Core`, and show what `State.playback` says. The video itself is drawn by
-//! the function the caller passes in.
+//! [`MpvView`]. The audio and subtitle menus are the one exception to the commands: they pick a
+//! track on the `MpvView` directly, because that choice is local to the player.
 
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use streem_core::{Command, Core, Playback, State};
+
+use crate::mpv_view::{MpvView, Track};
 
 /// The bar and the pointer disappear after this long without the mouse moving.
 const HIDE_AFTER: Duration = Duration::from_secs(3);
@@ -15,11 +18,15 @@ const HIDE_AFTER: Duration = Duration::from_secs(3);
 const KEY_SEEK_SECS: f64 = 10.0;
 /// Room beside the slider for the time label.
 const TIME_LABEL_WIDTH: f32 = 170.0;
+/// The width of the audio and subtitle menus' buttons.
+const TRACK_MENU_WIDTH: f32 = 150.0;
 
 pub struct PlayerScreen {
     last_activity: Instant,
     /// Where the slider is while it is being dragged. Nothing is sent until it is let go.
     scrubbing: Option<f64>,
+    /// The audio or subtitle menu was open in the last frame, which keeps the bar visible.
+    menu_open: bool,
 }
 
 impl Default for PlayerScreen {
@@ -27,19 +34,14 @@ impl Default for PlayerScreen {
         PlayerScreen {
             last_activity: Instant::now(),
             scrubbing: None,
+            menu_open: false,
         }
     }
 }
 
 impl PlayerScreen {
-    /// Draws the video with `paint_video`, then the bar and the keyboard shortcuts.
-    pub fn ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        state: &State,
-        core: &Core,
-        paint_video: impl FnOnce(&egui::Ui, egui::Rect),
-    ) {
+    /// Draws the video, then the bar and the keyboard shortcuts.
+    pub fn ui(&mut self, ui: &mut egui::Ui, state: &State, core: &Core, video: &MpvView) {
         let Some(playback) = &state.playback else {
             return;
         };
@@ -54,7 +56,7 @@ impl PlayerScreen {
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
                 let rect = ui.max_rect();
-                paint_video(ui, rect);
+                video.paint(ui, rect);
                 if playback.buffering {
                     ui.put(
                         egui::Rect::from_center_size(rect.center(), egui::vec2(48.0, 48.0)),
@@ -64,7 +66,7 @@ impl PlayerScreen {
             });
 
         if self.bar_is_visible() {
-            self.bar(&ctx, playback, core);
+            self.bar(&ctx, playback, core, video);
         } else {
             ctx.set_cursor_icon(egui::CursorIcon::None);
             self.scrubbing = None;
@@ -75,6 +77,7 @@ impl PlayerScreen {
     pub fn on_leave(&mut self) {
         self.last_activity = Instant::now();
         self.scrubbing = None;
+        self.menu_open = false;
     }
 
     fn keys(&mut self, ctx: &egui::Context, playback: &Playback, core: &Core) {
@@ -129,10 +132,10 @@ impl PlayerScreen {
     }
 
     fn bar_is_visible(&self) -> bool {
-        self.last_activity.elapsed() < HIDE_AFTER || self.scrubbing.is_some()
+        self.last_activity.elapsed() < HIDE_AFTER || self.scrubbing.is_some() || self.menu_open
     }
 
-    fn bar(&mut self, ctx: &egui::Context, playback: &Playback, core: &Core) {
+    fn bar(&mut self, ctx: &egui::Context, playback: &Playback, core: &Core, video: &MpvView) {
         egui::Area::new(egui::Id::unique("player-bar"))
             .anchor(egui::Align2::LEFT_BOTTOM, [0.0, 0.0])
             .show(ctx, |ui| {
@@ -154,10 +157,33 @@ impl PlayerScreen {
                             if ui.button(label).clicked() {
                                 core.send(Command::SetPaused(!playback.paused));
                             }
+                            self.track_menus(ui, playback, video);
                             self.seek_slider(ui, playback, core);
                         });
                     });
             });
+    }
+
+    /// The audio menu, and the subtitle menu: "Off", the tracks inside the file, then the
+    /// **addon** ones. Picking one switches at once.
+    fn track_menus(&mut self, ui: &mut egui::Ui, playback: &Playback, video: &MpvView) {
+        let tracks = video.tracks(&playback.subtitles);
+
+        let audio = track_menu(ui, "audio-track", "Audio", &tracks.audio, None);
+        if let Some(Some(id)) = audio.picked {
+            video.select_audio(id);
+        }
+        let subtitles = track_menu(
+            ui,
+            "subtitle-track",
+            "Subtitles",
+            &tracks.subtitles,
+            Some("Off"),
+        );
+        if let Some(choice) = subtitles.picked {
+            video.select_subtitle(choice);
+        }
+        self.menu_open = audio.open || subtitles.open;
     }
 
     fn seek_slider(&mut self, ui: &mut egui::Ui, playback: &Playback, core: &Core) {
@@ -178,6 +204,50 @@ impl PlayerScreen {
             self.scrubbing = None;
         }
         ui.label(format!("{} / {}", clock(position), clock(duration)));
+    }
+}
+
+/// What a track menu did this frame.
+struct MenuOutcome {
+    open: bool,
+    /// Something was picked: a track's id, or `None` for the "Off" entry.
+    picked: Option<Option<i64>>,
+}
+
+/// A menu of `tracks` whose button reads "`name`: selected track". With `off`, the first entry
+/// turns the tracks off.
+fn track_menu(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    name: &str,
+    tracks: &[Track],
+    off: Option<&str>,
+) -> MenuOutcome {
+    let selected = tracks.iter().find(|track| track.selected);
+    let current = selected
+        .map(|track| track.label.as_str())
+        .or(off)
+        .unwrap_or("None");
+    let mut picked = None;
+    let response = egui::ComboBox::from_id_salt(id_salt)
+        .width(TRACK_MENU_WIDTH)
+        .truncate()
+        .selected_text(format!("{name}: {current}"))
+        .show_ui(ui, |ui| {
+            if let Some(off) = off
+                && ui.selectable_label(selected.is_none(), off).clicked()
+            {
+                picked = Some(None);
+            }
+            for track in tracks {
+                if ui.selectable_label(track.selected, &track.label).clicked() {
+                    picked = Some(Some(track.id));
+                }
+            }
+        });
+    MenuOutcome {
+        open: response.inner.is_some(),
+        picked,
     }
 }
 

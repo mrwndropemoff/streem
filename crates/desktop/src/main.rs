@@ -83,10 +83,7 @@ impl App {
             return;
         };
         video.sync(ui.ctx(), playback, &self.core);
-        let video = &*video;
-        self.player.ui(ui, state, &self.core, |ui, rect| {
-            video.paint(ui, rect);
-        });
+        self.player.ui(ui, state, &self.core, video);
     }
 
     /// Called every frame while nothing is playing. The first time after something was, it

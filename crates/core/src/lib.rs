@@ -55,7 +55,9 @@ pub enum Command {
     },
     /// Plays one stream of the open title's current stream list: `stream_index` counts within
     /// the group of the **addon** with id `addon_id`. Ignored when there is no such stream or it
-    /// is not playable.
+    /// is not playable. Playback starts at once; the **addons** that offer `subtitles` for the
+    /// video are asked in the background, and their tracks are added to
+    /// [`Playback::subtitles`] as they arrive.
     Play {
         addon_id: String,
         stream_index: usize,
@@ -155,9 +157,24 @@ pub struct Playback {
     /// Zero until the player knows it.
     pub duration_secs: f64,
     pub buffering: bool,
+
+    /// Subtitles supplied by **addons**, in the order they arrived. Starts empty and only grows
+    /// while the same video plays. The tracks inside the file are not listed here.
+    pub subtitles: Vec<SubtitleTrack>,
 }
 
-// By hand, so that no `{:?}` of the state, in a log or a failed test, can print the link.
+/// A subtitle file an **addon** offers for the video being played.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleTrack {
+    /// As the **addon** gave it, usually an ISO 639-2 code such as `eng`.
+    pub lang: String,
+    /// An `http://` or `https://` link. Only the player reads it.
+    pub url: String,
+    pub addon_name: String,
+}
+
+// By hand, so that no `{:?}` of the state, in a log or a failed test, can print the link or the
+// links of the subtitles.
 impl std::fmt::Debug for Playback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Playback")
@@ -170,6 +187,7 @@ impl std::fmt::Debug for Playback {
             .field("position_secs", &self.position_secs)
             .field("duration_secs", &self.duration_secs)
             .field("buffering", &self.buffering)
+            .field("subtitles", &self.subtitles.len())
             .finish_non_exhaustive()
     }
 }

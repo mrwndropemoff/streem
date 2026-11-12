@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::addon::client::{
-    catalog_url, fetch_catalog, fetch_manifest, fetch_meta, fetch_streams, http_client, meta_url,
-    normalize_url, parse_manifest, search_url, stream_url,
+    catalog_url, fetch_catalog, fetch_manifest, fetch_meta, fetch_streams, fetch_subtitles,
+    http_client, meta_url, normalize_url, parse_manifest, search_url, stream_url, subtitles_url,
 };
 use crate::addon::types::{
     Manifest, ManifestCatalog, Meta, MetaPreview, Stream, StreamSource, is_http,
@@ -22,8 +22,8 @@ use crate::playback::{self, Links, Reported};
 use crate::posters::{self, Poster, PosterCache};
 use crate::store::{Store, StoreError, StoredAddon};
 use crate::{
-    CatalogRow, Command, Details, InstalledAddon, Load, Notice, Search, State, StreamGroup,
-    StreamItem, StreamList,
+    CatalogRow, Command, Details, InstalledAddon, Load, Notice, Playback, Search, State,
+    StreamGroup, StreamItem, StreamList, SubtitleTrack,
 };
 
 /// Position-only reports from the player are published at most this often.
@@ -65,6 +65,13 @@ pub(crate) enum Message {
         generation: u64,
         addon_url: String,
         result: Result<Vec<Stream>, String>,
+    },
+    /// One **addon** answered a subtitles request with these tracks. A failing **addon** sends
+    /// nothing. Ignored when `generation` is not the latest one, which means another stream
+    /// started, or nothing is playing any more, since the request was made.
+    Subtitles {
+        generation: u64,
+        tracks: Vec<SubtitleTrack>,
     },
 }
 
@@ -147,6 +154,9 @@ impl App {
         let mut streams_generation = 0;
         // The links of the streams in those groups. The UI never sees them.
         let mut stream_links: Links = Vec::new();
+        // Which playback the running subtitles fetches belong to. Grows with every stream
+        // that starts playing.
+        let mut playback_generation = 0;
         // When a report from the player was last published, for `POSITION_PUBLISH_INTERVAL`.
         let mut last_report_published: Option<Instant> = None;
         // When a held-back position must be published, if the player sends nothing before then.
@@ -266,7 +276,25 @@ impl App {
                 Message::Command(Command::Play {
                     addon_id,
                     stream_index,
-                }) => playback::play(&mut state, &stream_links, &addon_id, stream_index),
+                }) => {
+                    if playback::play(&mut state, &stream_links, &addon_id, stream_index)
+                        && let Some(playback) = &state.playback
+                    {
+                        playback_generation += 1;
+                        start_subtitles(
+                            &client,
+                            &self.sender,
+                            &manifests,
+                            playback,
+                            playback_generation,
+                        );
+                    }
+                }
+                Message::Subtitles { generation, tracks } => {
+                    if generation == playback_generation {
+                        playback::add_subtitles(&mut state, tracks);
+                    }
+                }
                 Message::Command(Command::SetPaused(paused)) => {
                     playback::set_paused(&mut state, paused);
                 }
@@ -578,6 +606,44 @@ fn start_streams(
         });
     }
     (sources, StreamList { video_id, groups })
+}
+
+/// Asks every installed **addon** that offers `subtitles` for the playing video, all at once.
+/// Each answer comes back on its own; a failing **addon** is ignored silently, because missing
+/// subtitles must never stop playback or raise a notice. Only `http://` and `https://` links
+/// are kept, since the player opens whatever it is given.
+fn start_subtitles(
+    client: &reqwest::Client,
+    sender: &mpsc::UnboundedSender<Message>,
+    manifests: &[(String, Manifest)],
+    playback: &Playback,
+    generation: u64,
+) {
+    for (addon_url, manifest) in manifests {
+        if !manifest.offers("subtitles", &playback.meta_type, &playback.video_id) {
+            continue;
+        }
+        let client = client.clone();
+        let sender = sender.clone();
+        let url = subtitles_url(addon_url, &playback.meta_type, &playback.video_id);
+        let addon_name = manifest.name.clone();
+        tokio::spawn(async move {
+            let Ok(url) = url else { return };
+            let Ok(subtitles) = fetch_subtitles(&client, &url).await else {
+                return;
+            };
+            let tracks = subtitles
+                .into_iter()
+                .filter(|subtitle| is_http(&subtitle.url))
+                .map(|subtitle| SubtitleTrack {
+                    lang: subtitle.lang.unwrap_or_default(),
+                    url: subtitle.url,
+                    addon_name: addon_name.clone(),
+                })
+                .collect();
+            let _ = sender.send(Message::Subtitles { generation, tracks });
+        });
+    }
 }
 
 /// The link to play a stream from, kept inside `Core`. Only `http://` and `https://` links can
