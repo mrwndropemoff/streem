@@ -150,18 +150,46 @@ pub struct Meta {
 }
 
 /// An episode of a series, or the one playable item of a movie.
+///
+/// Only the `id` is required, because without it the video cannot be told apart or played.
+/// Every other field is read leniently, so one odd value (a `season` sent as text, both
+/// `title` and `name` present) never costs the episode its place in the list.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(from = "RawVideo")]
 pub struct Video {
     pub id: String,
-    /// Older **addons** call it `name`.
-    #[serde(default, alias = "name")]
     pub title: String,
-    #[serde(default)]
     pub season: Option<u32>,
-    #[serde(default)]
     pub episode: Option<u32>,
-    #[serde(default)]
     pub released: Option<String>,
+}
+
+/// The wire shape of a [`Video`]: `title` is called `name` by older **addons**.
+#[derive(Deserialize)]
+struct RawVideo {
+    id: String,
+    #[serde(default, deserialize_with = "text_or_number")]
+    title: Option<String>,
+    #[serde(default, deserialize_with = "text_or_number")]
+    name: Option<String>,
+    #[serde(default, deserialize_with = "number_or_text")]
+    season: Option<u32>,
+    #[serde(default, deserialize_with = "number_or_text")]
+    episode: Option<u32>,
+    #[serde(default, deserialize_with = "text_or_number")]
+    released: Option<String>,
+}
+
+impl From<RawVideo> for Video {
+    fn from(raw: RawVideo) -> Self {
+        Video {
+            id: raw.id,
+            title: raw.title.or(raw.name).unwrap_or_default(),
+            season: raw.season,
+            episode: raw.episode,
+            released: raw.released,
+        }
+    }
 }
 
 fn text_or_number<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -177,7 +205,26 @@ where
     )
 }
 
+/// A whole number sent as a number (`3`) or as text (`"3"`); anything else is `None`.
+fn number_or_text<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            Some(serde_json::Value::Number(number)) => {
+                number.as_u64().and_then(|n| u32::try_from(n).ok())
+            }
+            Some(serde_json::Value::String(text)) => text.trim().parse().ok(),
+            _ => None,
+        },
+    )
+}
+
 /// A list where an entry that cannot be read is skipped, and `null` is an empty list.
+///
+/// Entries are only skipped when they are unusable as a whole (for a [`Video`]: no `id`);
+/// a single odd field is handled by the entry's own type instead.
 fn lenient_list<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -225,6 +272,23 @@ mod tests {
         assert!(manifest.description.is_none());
         assert!(manifest.catalogs.is_empty());
         assert!(manifest.id_prefixes.is_none());
+    }
+
+    #[test]
+    fn a_video_with_odd_optional_fields_is_kept() {
+        let json = r#"{"name": "Show", "videos": [
+            {"id": "a", "title": "Both", "name": "Ignored", "season": "2", "episode": 4},
+            {"id": "b", "name": "Older", "season": null, "episode": "x"},
+            {"title": "No id"}
+        ]}"#;
+        let meta: Meta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.videos.len(), 2);
+        assert_eq!(meta.videos[0].title, "Both");
+        assert_eq!(meta.videos[0].season, Some(2));
+        assert_eq!(meta.videos[0].episode, Some(4));
+        assert_eq!(meta.videos[1].title, "Older");
+        assert_eq!(meta.videos[1].season, None);
+        assert_eq!(meta.videos[1].episode, None);
     }
 
     #[test]
