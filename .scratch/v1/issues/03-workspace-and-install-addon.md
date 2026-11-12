@@ -4,7 +4,7 @@
 
 **Blocked by:** 01, 02
 
-**Status:** done
+**Status:** ready-for-agent
 
 ## Read first
 
@@ -113,6 +113,8 @@ Catalogs, posters, playback, settings, sign-in.
 - `Core::start_with_defaults(data_dir, on_change, default_addon_urls)` is the same as `Core::start` but names the addons to install on first launch; tests pass an empty list so they stay offline. "First launch" means no `addons` rows at all, removed rows included, so removing Cinemeta does not bring it back.
 - The raw manifest text is what is stored in `manifest_json`; a state change is published only after the row is committed. All disk work runs through one worker so results cannot overtake each other.
 - Dropping `Core` stops and joins its thread.
+- A saved row whose manifest no longer parses is left out of `State.addons` without a notice. If a later ticket tightens `Manifest`, handle old rows then.
+- Known edge: removing an addon while a fetch of the same URL is still in flight lets the late save bring it back.
 - Installing a URL that is already installed refreshes its manifest and keeps its place; installing a removed one brings the row back at the end.
 
 **Verified**
@@ -120,3 +122,4 @@ Catalogs, posters, playback, settings, sign-in.
 - `cargo test -p streem-core -- --ignored` passes with internet access (real Cinemeta through a `stremio://` URL).
 - `cargo run -p streem-desktop` with an empty `STREEM_DATA_DIR`: took a screenshot of the window on Windows 11; it shows the install field, and Cinemeta 3.0.14 with its description and a Remove button. Not run on Linux. Install and Remove were not clicked in the real window; they are covered by the `Core` tests.
 - `grep -rn "reqwest\|rusqlite\|std::fs" crates/desktop/src` prints nothing.
+- Notice banner: started the app with `STREEM_DATA_DIR` under an existing file so the store could not open; a screenshot shows the red banner with a Dismiss button above the list. The Dismiss click itself is covered by a `Core` test, not clicked in the window.
