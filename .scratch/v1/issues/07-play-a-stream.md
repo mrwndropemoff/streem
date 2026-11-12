@@ -100,10 +100,10 @@ Subtitle and audio menus, resume position, watch history, Real-Debrid, **watch p
 
 ## Acceptance checks
 
-- [ ] `cargo test -p streem-core` passes, including tests that: `Play` on a playable stream sets `playback` with the right url and `paused == false`; `Play` on an unplayable stream changes nothing; `SetPaused(true)` sets `paused`; two `Seek` commands produce increasing `seek.id` values; a seek beyond the duration is clamped; a report with `ended` clears `playback`; a report with `failed` clears `playback` and sets the notice.
-- [ ] `grep -n "mpv" crates/desktop/src/screens/player.rs` shows no direct mpv call for play, pause or seek.
-- [ ] `grep -rn "mpv" crates/core/` prints nothing outside comments.
-- [ ] `cargo run -p streem-desktop`: pick a title with a direct HTTP stream and click it.
+- [x] `cargo test -p streem-core` passes, including tests that: `Play` on a playable stream sets `playback` with the right url and `paused == false`; `Play` on an unplayable stream changes nothing; `SetPaused(true)` sets `paused`; two `Seek` commands produce increasing `seek.id` values; a seek beyond the duration is clamped; a report with `ended` clears `playback`; a report with `failed` clears `playback` and sets the notice.
+- [x] `grep -n "mpv" crates/desktop/src/screens/player.rs` shows no direct mpv call for play, pause or seek.
+- [x] `grep -rn "mpv" crates/core/` prints nothing outside comments.
+- [x] `cargo run -p streem-desktop`: pick a title with a direct HTTP stream and click it.
 
 ## Human check
 
@@ -122,3 +122,18 @@ Subtitle and audio menus, resume position, watch history, Real-Debrid, **watch p
 - When done, tick the boxes and add a line under `## Comments` saying what you verified and how.
 
 ## Comments
+
+- **Core.** `cargo test --workspace` passes: 13 new wiremock tests in `crates/core/tests/core.rs` (play with link and title, an episode's "Name · S1E2 · Title", unplayable or missing stream changes nothing, pause, increasing seek ids, clamping both ways, report fields, ended and stop clear playback with no notice, failed clears it and raises the notice, late commands and reports after the end are ignored, position reports raise `on_change` at most once a second, and the link is not in `{:?}` output). I broke the throttle on purpose to see its test fail (50 `on_change` calls), then restored it. `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings` are clean. Both greps in the acceptance list print nothing.
+- **Desktop, run by the agent on Windows 11** with a small local Node server standing in as an **addon** (manifest, meta, one good and one 404 stream, and `sample.mkv` with Range support), and a throwaway script (not committed) that sent `Command`s to `Core` and logged `State` once a second. Seen: the duration arrives after load; pause freezes the position; a seek while paused moves the position and playback continues from there after resume; a seek past the end ends the file, clears `playback` and shows details again with no notice; the 404 stream raises "This stream could not be played. Pick another one." and returns to the stream list; playing the same stream again after Stop works; closing the window while playing exits with code 0. By real mouse and keyboard on the running window, with screenshots: Home poster, Details, clicking a stream row (a good one plays, the broken one raises the notice), the control bar over the video with title, Back, Pause, slider and time, the bar hiding after 3 seconds and coming back on mouse movement, a plain click on the seek slider (seeked to the click), Back, Space, Left (-10 s), Right (+10 s), Escape, and F going to fullscreen and Escape leaving it.
+- **Not checked by the agent:** dragging the slider (only a plain click was tried), the buffering spinner, Linux, a very long file, and the **Human check** list below, which stays unticked for a person to run.
+- **Windows setup for this ticket** (full steps are in the README): `libmpv-2.dll` must be copied next to the program, `target\debug\` for `cargo run` and `cargo test -p streem-desktop`; without it the program does not start. The linking setup from ticket 02 (`mpv.lib` and `%USERPROFILE%\.cargo\config.toml`) was already in place on this machine. The crate is `libmpv2` 7.0.1, the same as the prototype.
+- **Choices that go beyond the ticket text:**
+  - `Seek` also sets `position_secs` to the target, so the slider does not jump back until the next report. While the duration is still 0 (unknown), a seek is only clamped at 0.
+  - `CloseTitle` also stops playback, since the stream list it came from is gone.
+  - `Core` keeps each stream's link in a list parallel to the stream groups (`stream_links` in `app.rs`). `Playback` has a hand-written `Debug` that leaves the link out. `State` and `Command` no longer derive `Eq`, because they now hold `f64`.
+  - The player screen replaces the whole window while `State.playback` is set (no top bar, no notice banner), and `after_playback` in `main.rs` leaves fullscreen when playback ends.
+  - If libmpv cannot start, the app still opens; playing a stream then reports a failure, which raises the same notice.
+  - One mpv instance is created at startup and never freed (`Box::leak`, as in the prototype). Freeing the render context needs the OpenGL context current, which is not guaranteed at shutdown.
+  - mpv's `terminal` is off, so mpv never prints a stream link.
+  - Space, the arrow keys and Escape are consumed before the widgets are drawn, so a focused button or slider does not act on the same key press twice. A click on the seek slider that is not a drag is handled too (`drag_stopped` does not fire for it).
+- The existing "← Back" button on the details screen shows a missing-glyph box on this Windows machine (the default egui font has no arrow). The player's button says just "Back". The details one is from an earlier ticket and was left alone.

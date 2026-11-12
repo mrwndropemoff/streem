@@ -193,6 +193,7 @@ impl MpvView {
     pub fn stop(&mut self) {
         if self.loaded.take().is_some() {
             let _ = self.mpv.command("stop", &[]);
+            self.drain_events();
             self.file_loaded = false;
             self.applied_seek = 0;
             self.last_report = None;
@@ -200,7 +201,14 @@ impl MpvView {
         }
     }
 
+    /// Forgets events that are still queued, so that ones about the old file are not taken
+    /// for ones about the next.
+    fn drain_events(&self) {
+        while self.mpv.wait_event(0.0).is_some() {}
+    }
+
     fn load(&mut self, playback: &Playback) {
+        self.drain_events();
         self.file_loaded = false;
         self.applied_seek = 0;
         self.last_report = None;

@@ -247,7 +247,7 @@ fn stream_list(
         return None;
     }
     let mut play = None;
-    for group in &list.groups {
+    for (group_index, group) in list.groups.iter().enumerate() {
         ui.add_space(8.0);
         ui.strong(&group.addon_name);
         match &group.streams {
@@ -259,7 +259,7 @@ fn stream_list(
             }
             Load::Ready(items) => {
                 for (index, item) in items.iter().enumerate() {
-                    if stream_row(ui, item) {
+                    if stream_row(ui, item, (group_index, index)) {
                         play = Some(Command::Play {
                             addon_id: group.addon_id.clone(),
                             stream_index: index,
@@ -274,7 +274,7 @@ fn stream_list(
 
 /// One stream: its name and description. An unplayable one is greyed out with the reason.
 /// Returns true when a playable one was clicked.
-fn stream_row(ui: &mut egui::Ui, item: &StreamItem) -> bool {
+fn stream_row(ui: &mut egui::Ui, item: &StreamItem, position: (usize, usize)) -> bool {
     let shown = ui.add_enabled_ui(item.playable, |ui| {
         egui::Frame::group(ui.style())
             .show(ui, |ui| {
@@ -295,7 +295,11 @@ fn stream_row(ui: &mut egui::Ui, item: &StreamItem) -> bool {
     }
     let rect = shown.inner;
     let response = ui
-        .interact(rect, ui.next_auto_id(), egui::Sense::click())
+        .interact(
+            rect,
+            ui.scope_id().with(("stream", position)),
+            egui::Sense::click(),
+        )
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     if response.hovered() {
         ui.painter().rect_stroke(

@@ -147,7 +147,7 @@ impl PlayerScreen {
                                 .truncate(),
                         );
                         ui.horizontal(|ui| {
-                            if ui.button("← Back").clicked() {
+                            if ui.button("Back").clicked() {
                                 core.send(Command::StopPlayback);
                             }
                             let label = if playback.paused { "Play" } else { "Pause" };
@@ -169,7 +169,9 @@ impl PlayerScreen {
         if response.dragged() || response.changed() {
             self.scrubbing = Some(position);
         }
-        if response.drag_stopped() {
+        // Letting go of a drag, or a plain click on the track, which is not a drag.
+        let released = response.drag_stopped() || response.clicked();
+        if released && self.scrubbing.is_some() {
             core.send(Command::Seek {
                 position_secs: position,
             });
