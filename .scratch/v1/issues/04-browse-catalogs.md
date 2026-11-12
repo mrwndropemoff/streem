@@ -110,8 +110,8 @@ Clicking a poster, search, continue-watching, pagination.
 - The desktop keeps one egui texture per poster URL and only asks for posters whose cell is visible.
 
 **Verified**
-- `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`: all pass (17 unit tests, 25 integration tests, 1 ignored).
-- Tests against `wiremock`: two catalogs go `Loading` then `Ready`; HTTP 500 gives one `Failed` row while the other is `Ready`; a required extra gives no row; type and id are percent-encoded; `LoadHome` refetches; removal clears the rows; rows appear after a restart; the same poster requested twice makes one request and arrives scaled to 300 px wide; a new `Core` on the same data directory serves it with no request; a broken poster is requested once.
+- `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`: all pass (10 unit tests, 18 integration tests, 1 ignored). The extra tests written first were trimmed afterwards so the tests match this ticket's acceptance checks, as the spec's "Testing decisions" asks.
+- Tests against `wiremock`: two catalogs go `Loading` then `Ready`; HTTP 500 gives one `Failed` row while the other is `Ready`; a required extra gives no row; the same poster requested twice makes one request and arrives scaled to 300 px wide; a new `Core` on the same data directory serves it with no request.
 - `cargo run -p streem-desktop` with an empty `STREEM_DATA_DIR` on Windows 11: screenshot shows Cinemeta's rows ("Popular · movie", "Popular · series", "Featured · movie") with posters and names, and 31 files in `<data_dir>/posters`. The Home/Addons top bar was not clicked in the real window.
 - `grep -rn "reqwest\|rusqlite\|std::fs" crates/desktop/src` prints nothing.
 - Human check done by the user: vertical and horizontal scrolling stayed smooth while posters loaded, and the Home/Addons top bar worked. All posters loaded in their run; the failed-poster case was not seen.

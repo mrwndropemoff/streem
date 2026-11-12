@@ -134,27 +134,6 @@ mod tests {
     }
 
     #[test]
-    fn catalog_extras_decide_whether_it_can_be_listed() {
-        let json = r#"[
-            {"type": "movie", "id": "top", "extra": [{"name": "skip"}, {"name": "genre", "options": ["A"]}]},
-            {"type": "movie", "id": "search", "name": "Search", "extra": [{"name": "search", "isRequired": true}]}
-        ]"#;
-        let catalogs: Vec<ManifestCatalog> = serde_json::from_str(json).unwrap();
-        assert!(!catalogs[0].has_required_extra());
-        assert_eq!(catalogs[0].display_name(), "top");
-        assert!(catalogs[1].has_required_extra());
-        assert_eq!(catalogs[1].display_name(), "Search");
-    }
-
-    #[test]
-    fn an_odd_extra_entry_does_not_break_the_manifest() {
-        let json = r#"{"id":"a","version":"0.1.0","name":"A","types":[],"resources":[],
-            "catalogs":[{"type":"movie","id":"top","extra":[{"isRequired":null},{"name":"skip"}]}]}"#;
-        let manifest: Manifest = serde_json::from_str(json).unwrap();
-        assert!(!manifest.catalogs[0].has_required_extra());
-    }
-
-    #[test]
     fn rejects_a_manifest_without_a_name() {
         let json = r#"{"id":"a","version":"0.1.0","types":[],"resources":[]}"#;
         assert!(serde_json::from_str::<Manifest>(json).is_err());

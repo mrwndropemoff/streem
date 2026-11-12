@@ -117,18 +117,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_url_replaces_the_manifest_and_encodes_type_and_id() {
-        assert_eq!(
-            catalog_url("https://example.com/a/manifest.json", "movie", "top").unwrap(),
-            "https://example.com/a/catalog/movie/top.json"
-        );
-        assert_eq!(
-            catalog_url("https://example.com/manifest.json?x=1", "my type", "a/b").unwrap(),
-            "https://example.com/catalog/my%20type/a%2Fb.json"
-        );
-    }
-
-    #[test]
     fn stremio_scheme_becomes_https() {
         assert_eq!(
             normalize_url("stremio://example.com/a/manifest.json").unwrap(),
