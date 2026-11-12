@@ -37,6 +37,9 @@ pub(crate) enum Message {
     Fetched(u64, Result<String, String>),
     /// A disk job finished. The error is text for a [`Notice`].
     Stored(Result<StoreOutput, String>),
+    /// A position held back by `POSITION_PUBLISH_INTERVAL` may now be published. Sent by the
+    /// task's own timer, not by the UI.
+    PublishHeldBack,
     /// The UI asked for a poster it has not asked for before.
     LoadPoster(String),
     /// A poster finished loading, or could not be.
@@ -132,10 +135,17 @@ impl App {
         let mut stream_links: Links = Vec::new();
         // When a report from the player was last published, for `POSITION_PUBLISH_INTERVAL`.
         let mut last_report_published: Option<Instant> = None;
+        // When a held-back position must be published, if the player sends nothing before then.
+        let mut held_back_until: Option<Instant> = None;
 
         loop {
+            // The future is built even when the branch is off, so it needs some instant.
+            let deadline = held_back_until.unwrap_or_else(Instant::now);
             let message = tokio::select! {
                 message = self.inbox.recv() => message,
+                () = tokio::time::sleep_until(deadline.into()), if held_back_until.is_some() => {
+                    Some(Message::PublishHeldBack)
+                }
                 _ = &mut self.shutdown => None,
             };
             let Some(message) = message else { break };
@@ -145,6 +155,7 @@ impl App {
             // Set when the state changed only by a position nobody needs to hear about yet.
             let mut hold_back = false;
             match message {
+                Message::PublishHeldBack => last_report_published = Some(Instant::now()),
                 Message::Command(Command::InstallAddon { url }) => to_install.push(url),
                 Message::Command(Command::LoadHome) => reload_home = true,
                 Message::LoadPoster(url) => {
@@ -235,9 +246,10 @@ impl App {
                         Reported::Changed => last_report_published = Some(Instant::now()),
                         Reported::PositionOnly => {
                             let recent = last_report_published
-                                .is_some_and(|at| at.elapsed() < POSITION_PUBLISH_INTERVAL);
-                            if recent {
+                                .filter(|at| at.elapsed() < POSITION_PUBLISH_INTERVAL);
+                            if let Some(at) = recent {
                                 hold_back = true;
+                                held_back_until = Some(at + POSITION_PUBLISH_INTERVAL);
                             } else {
                                 last_report_published = Some(Instant::now());
                             }
@@ -333,6 +345,10 @@ impl App {
                         state.notice = Some(notice(&mut next_notice_id, text));
                     }
                 }
+            }
+            if !hold_back {
+                // Whatever was held back goes out now with the rest of the state.
+                held_back_until = None;
             }
             if !hold_back && *published != state {
                 published = Arc::new(state.clone());

@@ -1532,7 +1532,21 @@ async fn position_reports_publish_at_most_once_a_second() {
         "on_change was called {during} times in about half a second"
     );
 
-    // Held back is not lost: a position report a second later is published.
+    // Held back is not lost: once the second is up, the last position is published even
+    // though the player sends nothing more.
+    let last = 6.0 + f64::from(49) * 0.01;
+    let waiting = std::time::Instant::now();
+    wait_for(&core, "held-back position published", |s| {
+        s.playback.as_ref().is_some_and(|p| p.position_secs == last)
+    })
+    .await;
+    assert!(
+        waiting.elapsed() < Duration::from_millis(1500),
+        "the held-back position took {:?} to be published",
+        waiting.elapsed()
+    );
+
+    // And a position report after that is published too.
     tokio::time::sleep(Duration::from_millis(1100)).await;
     core.send(Command::ReportPlayback(report(50.0, 100.0)));
     wait_for(&core, "position published", |s| {
