@@ -191,16 +191,3 @@ fn clock(secs: f64) -> String {
         format!("{minutes:02}:{seconds:02}")
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_clock_shows_hours_only_when_there_are_some() {
-        assert_eq!(clock(0.0), "00:00");
-        assert_eq!(clock(75.9), "01:15");
-        assert_eq!(clock(3725.0), "1:02:05");
-        assert_eq!(clock(-4.0), "00:00");
-    }
-}

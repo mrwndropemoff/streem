@@ -57,7 +57,7 @@ impl App {
 
     /// The player screen, shown in place of everything else while `State.playback` is set.
     /// Playing and stopping are `Command`s; this only makes the video match the state.
-    fn play(&mut self, ui: &mut egui::Ui, state: &State) {
+    fn show_player(&mut self, ui: &mut egui::Ui, state: &State) {
         self.was_playing = true;
         let Some(playback) = &state.playback else {
             return;
@@ -107,7 +107,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let state = self.core.state();
         if state.playback.is_some() {
-            self.play(ui, &state);
+            self.show_player(ui, &state);
             return;
         }
         self.after_playback(&ui.ctx().clone());

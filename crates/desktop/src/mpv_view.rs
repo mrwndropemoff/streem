@@ -122,8 +122,12 @@ impl MpvView {
     /// Makes mpv match `playback`, and reports back to `core`. Called every frame while
     /// something is playing.
     pub fn sync(&mut self, ctx: &egui::Context, playback: &Playback, core: &Core) {
-        if self.loaded.as_deref() != Some(playback.url.as_str()) {
-            self.load(playback);
+        if self.loaded.as_deref() != Some(playback.url.as_str())
+            && let Err(error) = self.load(playback)
+        {
+            // mpv refused the command itself, so no event will ever say so.
+            self.send_report(core, false, false, Some(format!("mpv: {error}")));
+            return;
         }
         let mut failed = None;
         let mut ended = false;
@@ -143,14 +147,7 @@ impl MpvView {
             }
         }
         if failed.is_some() || ended {
-            self.last_report = Some(Instant::now());
-            core.send(Command::ReportPlayback(PlaybackReport {
-                position_secs: self.number("time-pos"),
-                duration_secs: self.number("duration"),
-                buffering: false,
-                ended,
-                failed,
-            }));
+            self.send_report(core, false, ended, failed);
             return;
         }
 
@@ -173,14 +170,7 @@ impl MpvView {
             .is_none_or(|at| !playback.paused && at.elapsed() >= REPORT_INTERVAL);
         if just_loaded || buffering != self.last_buffering || due {
             self.last_buffering = buffering;
-            self.last_report = Some(Instant::now());
-            core.send(Command::ReportPlayback(PlaybackReport {
-                position_secs: self.number("time-pos"),
-                duration_secs: self.number("duration"),
-                buffering,
-                ended: false,
-                failed: None,
-            }));
+            self.send_report(core, buffering, false, None);
         }
         if !playback.paused {
             // Audio alone draws no frames, but the position still has to be reported.
@@ -194,11 +184,28 @@ impl MpvView {
         if self.loaded.take().is_some() {
             let _ = self.mpv.command("stop", &[]);
             self.drain_events();
-            self.file_loaded = false;
-            self.applied_seek = 0;
-            self.last_report = None;
-            self.last_buffering = false;
+            self.forget_file();
         }
+    }
+
+    /// Starts over for the next file.
+    fn forget_file(&mut self) {
+        self.file_loaded = false;
+        self.applied_seek = 0;
+        self.last_report = None;
+        self.last_buffering = false;
+    }
+
+    /// Tells `Core` what mpv is doing now.
+    fn send_report(&mut self, core: &Core, buffering: bool, ended: bool, failed: Option<String>) {
+        self.last_report = Some(Instant::now());
+        core.send(Command::ReportPlayback(PlaybackReport {
+            position_secs: self.number("time-pos"),
+            duration_secs: self.number("duration"),
+            buffering,
+            ended,
+            failed,
+        }));
     }
 
     /// Forgets events that are still queued, so that ones about the old file are not taken
@@ -207,21 +214,15 @@ impl MpvView {
         while self.mpv.wait_event(0.0).is_some() {}
     }
 
-    fn load(&mut self, playback: &Playback) {
+    /// Loads the link. Fails only when mpv refuses the command; a link it cannot open comes
+    /// back later as an event. The error never holds the link.
+    fn load(&mut self, playback: &Playback) -> libmpv2::Result<()> {
         self.drain_events();
-        self.file_loaded = false;
-        self.applied_seek = 0;
-        self.last_report = None;
-        self.last_buffering = false;
+        self.forget_file();
         let _ = self.mpv.set_property("pause", playback.paused);
-        let loading = self.mpv.command("loadfile", &[&playback.url, "replace"]);
-        // Remembered even when mpv refused the command, so it is not retried every frame.
-        // mpv reports a link it cannot open as an event, not here.
+        // Remembered even on failure, so it is not retried every frame.
         self.loaded = Some(playback.url.clone());
-        if let Err(error) = loading {
-            // Never print the link.
-            eprintln!("mpv refused to load the stream: {error}");
-        }
+        self.mpv.command("loadfile", &[&playback.url, "replace"])
     }
 
     fn paused(&self) -> bool {
