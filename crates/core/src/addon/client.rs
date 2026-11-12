@@ -1,8 +1,8 @@
-//! Fetching an **addon**'s manifest over HTTP.
+//! Talking to an **addon** over HTTP: its manifest, catalogs, metas and streams.
 
 use std::time::Duration;
 
-use super::types::{Manifest, Meta, MetaPreview, Video};
+use super::types::{Manifest, Meta, MetaPreview, Stream, Video};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AddonError {
@@ -20,6 +20,8 @@ pub enum AddonError {
     InvalidCatalog(serde_json::Error),
     #[error("the addon's description of the title is not valid: {0}")]
     InvalidMeta(serde_json::Error),
+    #[error("the addon's list of streams is not valid: {0}")]
+    InvalidStreams(serde_json::Error),
 }
 
 /// Turns what the user typed into the URL that identifies the **addon**.
@@ -68,12 +70,13 @@ pub async fn fetch_manifest(
     Ok((manifest, text))
 }
 
-/// The URL of a catalog: `{base}/catalog/{type}/{id}.json`, where `{base}` is the manifest URL
-/// without `/manifest.json`. `{type}` and `{id}` are percent-encoded.
-pub fn catalog_url(
+/// The URL of a resource request: `{base}/{resource}/{type}/{id}.json`, where `{base}` is the
+/// manifest URL without `/manifest.json`. `{type}` and `{id}` are percent-encoded.
+fn resource_url(
     manifest_url: &str,
+    resource: &str,
     meta_type: &str,
-    catalog_id: &str,
+    id: &str,
 ) -> Result<String, AddonError> {
     let mut url = reqwest::Url::parse(manifest_url)
         .map_err(|_| AddonError::InvalidUrl(manifest_url.into()))?;
@@ -82,10 +85,19 @@ pub fn catalog_url(
     url.path_segments_mut()
         .map_err(|()| AddonError::InvalidUrl(manifest_url.into()))?
         .pop()
-        .push("catalog")
+        .push(resource)
         .push(meta_type)
-        .push(&format!("{catalog_id}.json"));
+        .push(&format!("{id}.json"));
     Ok(url.into())
+}
+
+/// The URL of a catalog: `{base}/catalog/{type}/{id}.json`.
+pub fn catalog_url(
+    manifest_url: &str,
+    meta_type: &str,
+    catalog_id: &str,
+) -> Result<String, AddonError> {
+    resource_url(manifest_url, "catalog", meta_type, catalog_id)
 }
 
 /// Downloads the first page of a catalog. An entry that lacks an id, type or name is skipped,
@@ -114,20 +126,43 @@ pub async fn fetch_catalog(
         .collect())
 }
 
-/// The URL of a meta request: `{base}/meta/{type}/{id}.json`. `{type}` and `{id}` are
-/// percent-encoded.
+/// The URL of a meta request: `{base}/meta/{type}/{id}.json`.
 pub fn meta_url(manifest_url: &str, meta_type: &str, meta_id: &str) -> Result<String, AddonError> {
-    let mut url = reqwest::Url::parse(manifest_url)
-        .map_err(|_| AddonError::InvalidUrl(manifest_url.into()))?;
-    url.set_query(None);
-    url.set_fragment(None);
-    url.path_segments_mut()
-        .map_err(|()| AddonError::InvalidUrl(manifest_url.into()))?
-        .pop()
-        .push("meta")
-        .push(meta_type)
-        .push(&format!("{meta_id}.json"));
-    Ok(url.into())
+    resource_url(manifest_url, "meta", meta_type, meta_id)
+}
+
+/// The URL of a stream request: `{base}/stream/{type}/{videoId}.json`. For a movie the video
+/// id is the meta id; for an episode it is the video's own id, such as `tt0903747:1:2`.
+pub fn stream_url(
+    manifest_url: &str,
+    meta_type: &str,
+    video_id: &str,
+) -> Result<String, AddonError> {
+    resource_url(manifest_url, "stream", meta_type, video_id)
+}
+
+/// Downloads the streams an **addon** offers for one video. An entry that is not an object is
+/// skipped, so one bad entry does not hide the rest.
+pub async fn fetch_streams(client: &reqwest::Client, url: &str) -> Result<Vec<Stream>, AddonError> {
+    #[derive(serde::Deserialize)]
+    struct Response {
+        #[serde(default)]
+        streams: Option<Vec<serde_json::Value>>,
+    }
+
+    let response = client.get(url).send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(AddonError::Status(status.as_u16()));
+    }
+    let text = response.text().await?;
+    let parsed: Response = serde_json::from_str(&text).map_err(AddonError::InvalidStreams)?;
+    Ok(parsed
+        .streams
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|stream| serde_json::from_value(stream).ok())
+        .collect())
 }
 
 /// Downloads the description of one title. A movie that comes back with no videos gets one

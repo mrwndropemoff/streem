@@ -38,6 +38,12 @@ pub enum Command {
         meta_id: String,
     },
     CloseTitle,
+    /// Lists the streams of one video of the open title: the meta id for a movie, the
+    /// episode's own id for a series. Asks every installed **addon** that offers `stream` for
+    /// the title's type and this id, all at once. Ignored when no title is open.
+    LoadStreams {
+        video_id: String,
+    },
 }
 
 /// Everything the UI draws. Replaced as a whole after every change.
@@ -57,6 +63,37 @@ pub struct Details {
     pub meta_type: String,
     pub meta_id: String,
     pub meta: Load<Meta>,
+    /// The streams of the video last asked for with [`Command::LoadStreams`].
+    pub streams: Option<StreamList>,
+}
+
+/// The streams of one video, grouped by the **addon** that supplied them, in **addon** order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamList {
+    pub video_id: String,
+    /// A group that loaded with no streams is dropped.
+    pub groups: Vec<StreamGroup>,
+}
+
+/// The streams one **addon** offers for a video.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamGroup {
+    /// The id in the **addon**'s manifest.
+    pub addon_id: String,
+    pub addon_name: String,
+    pub streams: Load<Vec<StreamItem>>,
+}
+
+/// One stream as the UI shows it. Its link stays inside `streem-core`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamItem {
+    pub name: String,
+    pub description: String,
+    pub filename: Option<String>,
+    /// True only for an `http://` or `https://` link.
+    pub playable: bool,
+    /// Text for the person using the app, set when `playable` is false.
+    pub unplayable_reason: Option<String>,
 }
 
 /// Something that is being fetched, or has been.

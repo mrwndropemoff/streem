@@ -1,11 +1,12 @@
-//! The details screen of one title: artwork, facts, and for a series a season picker with the
-//! episodes of the chosen season.
+//! The details screen of one title: artwork, facts, its streams, and for a series a season
+//! picker with the episodes of the chosen season.
 //!
 //! Everything here is drawing. The title comes from `State.details`; pictures come from
-//! `Core::poster`.
+//! `Core::poster`. Streams are asked for with `Command::LoadStreams`: for a movie as soon as
+//! its details are ready, for a series when an episode is clicked.
 
 use eframe::egui;
-use streem_core::{Core, Details, Load, Meta, State, Video};
+use streem_core::{Command, Core, Details, Load, Meta, State, StreamItem, StreamList, Video};
 
 use super::Textures;
 
@@ -19,6 +20,9 @@ pub struct DetailsScreen {
     /// The title the chosen season belongs to, as (type, id).
     shown: Option<(String, String)>,
     season: Option<u32>,
+    /// A movie's `LoadStreams` was sent and its answer is not in `State` yet. Stops it from
+    /// being sent again on every frame until `Core` handles it.
+    movie_streams_asked: bool,
 }
 
 impl DetailsScreen {
@@ -31,6 +35,9 @@ impl DetailsScreen {
             return back;
         };
         self.forget_season_of_another_title(details);
+        if details.streams.is_some() {
+            self.movie_streams_asked = false;
+        }
 
         match &details.meta {
             Load::Loading => {
@@ -40,13 +47,28 @@ impl DetailsScreen {
                 ui.colored_label(egui::Color32::LIGHT_RED, message);
             }
             Load::Ready(meta) => {
+                if details.meta_type == "movie"
+                    && details.streams.is_none()
+                    && !self.movie_streams_asked
+                {
+                    core.send(Command::LoadStreams {
+                        video_id: details.meta_id.clone(),
+                    });
+                    self.movie_streams_asked = true;
+                }
                 egui::ScrollArea::vertical()
                     .id_salt("details")
                     .auto_shrink([false, false])
-                    .show(ui, |ui| self.title(ui, meta, core));
+                    .show(ui, |ui| self.title(ui, details, meta, core));
             }
         }
         back
+    }
+
+    /// Called when the person leaves this screen, so that opening the same movie again asks
+    /// for its streams again.
+    pub fn left(&mut self) {
+        self.movie_streams_asked = false;
     }
 
     fn forget_season_of_another_title(&mut self, details: &Details) {
@@ -57,7 +79,7 @@ impl DetailsScreen {
         }
     }
 
-    fn title(&mut self, ui: &mut egui::Ui, meta: &Meta, core: &Core) {
+    fn title(&mut self, ui: &mut egui::Ui, details: &Details, meta: &Meta, core: &Core) {
         self.background(ui, meta, core);
         ui.add_space(12.0);
 
@@ -82,10 +104,30 @@ impl DetailsScreen {
             });
         });
 
+        let streams = details.streams.as_ref();
         let seasons = seasons(&meta.videos);
-        if !seasons.is_empty() {
+        if details.meta_type == "movie" {
             ui.add_space(16.0);
-            self.episodes(ui, &meta.videos, &seasons);
+            // Asked for as soon as the details were ready, so a missing list is on its way.
+            stream_list(ui, streams, None);
+        } else if !seasons.is_empty() {
+            ui.add_space(16.0);
+            ui.columns(2, |columns| {
+                let clicked = self.episodes(
+                    &mut columns[0],
+                    &meta.videos,
+                    &seasons,
+                    streams.map(|list| list.video_id.as_str()),
+                );
+                if let Some(video_id) = clicked {
+                    core.send(Command::LoadStreams { video_id });
+                }
+                stream_list(
+                    &mut columns[1],
+                    streams,
+                    Some("Choose an episode to see its streams."),
+                );
+            });
         }
     }
 
@@ -135,8 +177,15 @@ impl DetailsScreen {
         ui.add_space(8.0);
     }
 
-    /// The season dropdown and the episodes of the chosen season.
-    fn episodes(&mut self, ui: &mut egui::Ui, videos: &[Video], seasons: &[u32]) {
+    /// The season dropdown and the episodes of the chosen season. The episode whose streams are
+    /// shown is highlighted. Returns the id of the episode the person clicked.
+    fn episodes(
+        &mut self,
+        ui: &mut egui::Ui,
+        videos: &[Video],
+        seasons: &[u32],
+        selected: Option<&str>,
+    ) -> Option<String> {
         // The first season in the list, unless the person chose one that is still there.
         let chosen = match self.season {
             Some(season) if seasons.contains(&season) => season,
@@ -158,10 +207,74 @@ impl DetailsScreen {
             .filter(|video| video.season == Some(chosen))
             .collect();
         episodes.sort_by_key(|video| video.episode);
+        let mut clicked = None;
         for video in episodes {
-            ui.label(episode_label(video));
+            let is_selected = selected == Some(video.id.as_str());
+            if ui
+                .selectable_label(is_selected, episode_label(video))
+                .clicked()
+            {
+                clicked = Some(video.id.clone());
+            }
+        }
+        clicked
+    }
+}
+
+/// The streams under each **addon**'s name. `waiting` is shown while no streams were asked
+/// for; without it, a spinner is.
+fn stream_list(ui: &mut egui::Ui, streams: Option<&StreamList>, waiting: Option<&str>) {
+    ui.heading("Streams");
+    ui.add_space(4.0);
+    let Some(list) = streams else {
+        match waiting {
+            Some(text) => {
+                ui.weak(text);
+            }
+            None => {
+                ui.spinner();
+            }
+        }
+        return;
+    };
+    if list.groups.is_empty() {
+        ui.weak("No installed addon has streams for this.");
+        return;
+    }
+    for group in &list.groups {
+        ui.add_space(8.0);
+        ui.strong(&group.addon_name);
+        match &group.streams {
+            Load::Loading => {
+                ui.spinner();
+            }
+            Load::Failed(message) => {
+                ui.colored_label(egui::Color32::LIGHT_RED, message);
+            }
+            Load::Ready(items) => {
+                for item in items {
+                    stream_row(ui, item);
+                }
+            }
         }
     }
+}
+
+/// One stream: its name and description. An unplayable one is greyed out with the reason.
+/// Clicking a playable one does nothing yet.
+fn stream_row(ui: &mut egui::Ui, item: &StreamItem) {
+    ui.add_enabled_ui(item.playable, |ui| {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                ui.strong(&item.name);
+                ui.label(&item.description);
+            });
+            if let Some(reason) = &item.unplayable_reason {
+                ui.label(reason);
+            }
+        });
+    });
 }
 
 /// The seasons the videos belong to, ascending, with season 0 (specials) last.

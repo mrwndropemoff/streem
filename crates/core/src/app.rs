@@ -11,13 +11,16 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::addon::client::{
-    catalog_url, fetch_catalog, fetch_manifest, fetch_meta, http_client, meta_url, normalize_url,
-    parse_manifest,
+    catalog_url, fetch_catalog, fetch_manifest, fetch_meta, fetch_streams, http_client, meta_url,
+    normalize_url, parse_manifest, stream_url,
 };
-use crate::addon::types::{Manifest, ManifestCatalog, Meta, MetaPreview};
+use crate::addon::types::{Manifest, ManifestCatalog, Meta, MetaPreview, Stream, StreamSource};
 use crate::posters::{self, Poster, PosterCache};
 use crate::store::{Store, StoreError, StoredAddon};
-use crate::{CatalogRow, Command, Details, InstalledAddon, Load, Notice, State};
+use crate::{
+    CatalogRow, Command, Details, InstalledAddon, Load, Notice, State, StreamGroup, StreamItem,
+    StreamList,
+};
 
 /// What the task receives: the UI's commands, and results of work it started.
 pub(crate) enum Message {
@@ -43,6 +46,13 @@ pub(crate) enum Message {
     Meta {
         generation: u64,
         result: Result<Meta, String>,
+    },
+    /// One **addon** answered a stream request. Ignored when `generation` is not the latest
+    /// one, which means other streams were asked for, or the title was closed, since then.
+    Streams {
+        generation: u64,
+        addon_url: String,
+        result: Result<Vec<Stream>, String>,
     },
 }
 
@@ -107,6 +117,10 @@ impl App {
         // belongs to.
         let mut manifests: Vec<(String, Manifest)> = Vec::new();
         let mut details_generation = 0;
+        // The **addon** URL of each stream group, in the same order as the groups, and which
+        // stream request the running fetches belong to.
+        let mut stream_sources: Vec<String> = Vec::new();
+        let mut streams_generation = 0;
 
         loop {
             let message = tokio::select! {
@@ -144,6 +158,8 @@ impl App {
                 }
                 Message::Command(Command::OpenTitle { meta_type, meta_id }) => {
                     details_generation += 1;
+                    streams_generation += 1;
+                    stream_sources.clear();
                     let meta = start_meta(
                         &client,
                         &self.sender,
@@ -156,11 +172,54 @@ impl App {
                         meta_type,
                         meta_id,
                         meta,
+                        streams: None,
                     });
                 }
                 Message::Command(Command::CloseTitle) => {
                     details_generation += 1;
+                    streams_generation += 1;
+                    stream_sources.clear();
                     state.details = None;
+                }
+                Message::Command(Command::LoadStreams { video_id }) => {
+                    if let Some(details) = state.details.as_mut() {
+                        streams_generation += 1;
+                        let (sources, list) = start_streams(
+                            &client,
+                            &self.sender,
+                            &manifests,
+                            &details.meta_type,
+                            video_id,
+                            streams_generation,
+                        );
+                        stream_sources = sources;
+                        details.streams = Some(list);
+                    }
+                }
+                Message::Streams {
+                    generation,
+                    addon_url,
+                    result,
+                } => {
+                    if generation == streams_generation
+                        && let Some(list) = state
+                            .details
+                            .as_mut()
+                            .and_then(|details| details.streams.as_mut())
+                        && let Some(index) = stream_sources.iter().position(|url| *url == addon_url)
+                    {
+                        match result {
+                            Ok(streams) if streams.is_empty() => {
+                                list.groups.remove(index);
+                                stream_sources.remove(index);
+                            }
+                            Ok(streams) => {
+                                list.groups[index].streams =
+                                    Load::Ready(streams.into_iter().map(stream_item).collect());
+                            }
+                            Err(text) => list.groups[index].streams = Load::Failed(text),
+                        }
+                    }
                 }
                 Message::Meta { generation, result } => {
                     if generation == details_generation
@@ -330,7 +389,7 @@ fn start_meta(
 ) -> Load<Meta> {
     let Some((addon_url, _)) = manifests
         .iter()
-        .find(|(_, manifest)| manifest.offers_meta(meta_type, meta_id))
+        .find(|(_, manifest)| manifest.offers("meta", meta_type, meta_id))
     else {
         return Load::Failed(format!(
             "No installed addon can describe {meta_type} {meta_id}."
@@ -351,6 +410,71 @@ fn start_meta(
         let _ = sender.send(Message::Meta { generation, result });
     });
     Load::Loading
+}
+
+/// Builds a `Loading` group for every installed **addon** that offers `stream` for the type and
+/// video id, and fetches them all at once. Each group is answered on its own, so one failing
+/// **addon** never touches the others. Returns the **addon** URL of each group with the list.
+fn start_streams(
+    client: &reqwest::Client,
+    sender: &mpsc::UnboundedSender<Message>,
+    manifests: &[(String, Manifest)],
+    meta_type: &str,
+    video_id: String,
+    generation: u64,
+) -> (Vec<String>, StreamList) {
+    let mut sources = Vec::new();
+    let mut groups = Vec::new();
+    for (addon_url, manifest) in manifests {
+        if !manifest.offers("stream", meta_type, &video_id) {
+            continue;
+        }
+        sources.push(addon_url.clone());
+        groups.push(StreamGroup {
+            addon_id: manifest.id.clone(),
+            addon_name: manifest.name.clone(),
+            streams: Load::Loading,
+        });
+
+        let client = client.clone();
+        let sender = sender.clone();
+        let addon_url = addon_url.clone();
+        let meta_type = meta_type.to_string();
+        let video_id = video_id.clone();
+        tokio::spawn(async move {
+            let result = match stream_url(&addon_url, &meta_type, &video_id) {
+                Ok(url) => fetch_streams(&client, &url).await,
+                Err(error) => Err(error),
+            };
+            let result = result.map_err(|error| error.to_string());
+            let _ = sender.send(Message::Streams {
+                generation,
+                addon_url,
+                result,
+            });
+        });
+    }
+    (sources, StreamList { video_id, groups })
+}
+
+/// What the UI is told about a stream. Only `http://` and `https://` links can be played.
+fn stream_item(stream: Stream) -> StreamItem {
+    let unplayable_reason = match &stream.source {
+        StreamSource::Url(url) if is_http(url) => None,
+        StreamSource::Torrent { .. } => Some("Torrent streams are not supported"),
+        StreamSource::Url(_) | StreamSource::Other => Some("This kind of stream is not supported"),
+    };
+    StreamItem {
+        name: stream.name,
+        description: stream.description,
+        filename: stream.filename,
+        playable: unplayable_reason.is_none(),
+        unplayable_reason: unplayable_reason.map(str::to_string),
+    }
+}
+
+fn is_http(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
 }
 
 /// Loads a poster in the background, then reports back.
