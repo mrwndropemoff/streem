@@ -49,6 +49,31 @@ impl ManifestResource {
     }
 }
 
+impl Manifest {
+    /// True when this **addon** can answer a meta request for the type and id: it lists the
+    /// `meta` resource, and the type and the start of the id are within its limits. A resource
+    /// given as an object carries its own limits; a plain name uses the manifest's.
+    pub fn offers_meta(&self, meta_type: &str, meta_id: &str) -> bool {
+        self.resources.iter().any(|resource| {
+            if resource.name() != "meta" {
+                return false;
+            }
+            let (types, id_prefixes) = match resource {
+                ManifestResource::Short(_) => (None, None),
+                ManifestResource::Full {
+                    types, id_prefixes, ..
+                } => (types.as_ref(), id_prefixes.as_ref()),
+            };
+            let types = types.unwrap_or(&self.types);
+            let id_prefixes = id_prefixes.or(self.id_prefixes.as_ref());
+            types.iter().any(|offered| offered == meta_type)
+                && id_prefixes.is_none_or(|prefixes| {
+                    prefixes.iter().any(|prefix| meta_id.starts_with(prefix))
+                })
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestCatalog {
     #[serde(rename = "type")]
@@ -94,6 +119,75 @@ pub struct MetaPreview {
     pub name: String,
     #[serde(default)]
     pub poster: Option<String>,
+}
+
+/// The full description of a title, from a meta request.
+///
+/// Lenient on purpose: an entry that cannot be read is left out of a list, and a missing
+/// `id` or `type` is filled in from the request by the client.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Meta {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default, rename = "type")]
+    pub meta_type: String,
+    pub name: String,
+    #[serde(default)]
+    pub poster: Option<String>,
+    #[serde(default)]
+    pub background: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default, rename = "releaseInfo")]
+    pub release_info: Option<String>,
+    /// Addons send it as text (`"8.8"`) or as a number.
+    #[serde(default, rename = "imdbRating", deserialize_with = "text_or_number")]
+    pub rating: Option<String>,
+    #[serde(default, deserialize_with = "lenient_list")]
+    pub genres: Vec<String>,
+    #[serde(default, deserialize_with = "lenient_list")]
+    pub videos: Vec<Video>,
+}
+
+/// An episode of a series, or the one playable item of a movie.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Video {
+    pub id: String,
+    /// Older **addons** call it `name`.
+    #[serde(default, alias = "name")]
+    pub title: String,
+    #[serde(default)]
+    pub season: Option<u32>,
+    #[serde(default)]
+    pub episode: Option<u32>,
+    #[serde(default)]
+    pub released: Option<String>,
+}
+
+fn text_or_number<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            Some(serde_json::Value::String(text)) => Some(text),
+            Some(serde_json::Value::Number(number)) => Some(number.to_string()),
+            _ => None,
+        },
+    )
+}
+
+/// A list where an entry that cannot be read is skipped, and `null` is an empty list.
+fn lenient_list<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let values = Option::<Vec<serde_json::Value>>::deserialize(deserializer)?.unwrap_or_default();
+    Ok(values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect())
 }
 
 #[cfg(test)]

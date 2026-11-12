@@ -6,12 +6,14 @@ mod screens;
 use std::path::PathBuf;
 
 use eframe::egui;
-use streem_core::Core;
+use streem_core::{Command, Core};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Home,
     Addons,
+    /// The title in `State.details`. Back goes to Home, the only place a title is opened from.
+    Details,
 }
 
 struct App {
@@ -19,6 +21,7 @@ struct App {
     screen: Screen,
     home: screens::home::HomeScreen,
     addons: screens::addons::AddonsScreen,
+    details: screens::details::DetailsScreen,
 }
 
 impl App {
@@ -30,7 +33,14 @@ impl App {
             screen: Screen::Home,
             home: Default::default(),
             addons: Default::default(),
+            details: Default::default(),
         }
+    }
+
+    /// Leaves the details screen for `screen` and tells the core the title is closed.
+    fn leave_details(&mut self, screen: Screen) {
+        self.core.send(Command::CloseTitle);
+        self.screen = screen;
     }
 }
 
@@ -38,15 +48,34 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let state = self.core.state();
         screens::notice_banner(ui, &state, &self.core);
+        let before = self.screen;
         egui::Panel::top("navigation").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.screen, Screen::Home, "Home");
                 ui.selectable_value(&mut self.screen, Screen::Addons, "Addons");
             });
         });
+        if before == Screen::Details && self.screen != Screen::Details {
+            // A tab was clicked while a title was open.
+            self.leave_details(self.screen);
+        }
+
         egui::CentralPanel::default().show(ui, |ui| match self.screen {
-            Screen::Home => self.home.ui(ui, &state, &self.core),
+            Screen::Home => {
+                if let Some(item) = self.home.ui(ui, &state, &self.core) {
+                    self.core.send(Command::OpenTitle {
+                        meta_type: item.meta_type,
+                        meta_id: item.id,
+                    });
+                    self.screen = Screen::Details;
+                }
+            }
             Screen::Addons => self.addons.ui(ui, &state, &self.core),
+            Screen::Details => {
+                if self.details.ui(ui, &state, &self.core) {
+                    self.leave_details(Screen::Home);
+                }
+            }
         });
     }
 }

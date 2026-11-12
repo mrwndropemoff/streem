@@ -544,3 +544,238 @@ async fn a_new_core_on_the_same_data_directory_makes_no_request_for_a_saved_post
     assert_eq!((poster.width, poster.height), (300, 450));
     assert_eq!(poster_requests(&server).await, 1);
 }
+
+// ---- Title details ------------------------------------------------------------------------
+
+/// An **addon** that offers the `meta` resource. `meta_resource` is the JSON of that entry.
+async fn serve_meta_addon(server: &MockServer, name: &str, meta_resource: &str) -> String {
+    let manifest = format!(
+        r#"{{"id": "org.example.{name}", "version": "1.0.0", "name": "{name}",
+            "types": ["movie", "series"], "resources": ["catalog", {meta_resource}]}}"#
+    );
+    Mock::given(method("GET"))
+        .and(path(format!("/{name}/manifest.json")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(manifest))
+        .mount(server)
+        .await;
+    format!("{}/{name}/manifest.json", server.uri())
+}
+
+async fn install(core: &Core, url: String, count: usize) {
+    core.send(Command::InstallAddon { url });
+    wait_for(core, "addon installed", |s| s.addons.len() == count).await;
+}
+
+fn details_settled(state: &State) -> bool {
+    state
+        .details
+        .as_ref()
+        .is_some_and(|details| !matches!(details.meta, Load::Loading))
+}
+
+async fn open_title(core: &Core, meta_type: &str, meta_id: &str) -> streem_core::Meta {
+    core.send(Command::OpenTitle {
+        meta_type: meta_type.into(),
+        meta_id: meta_id.into(),
+    });
+    let state = wait_for(core, "details settled", details_settled).await;
+    match &state.details.as_ref().unwrap().meta {
+        Load::Ready(meta) => meta.clone(),
+        other => panic!("not ready: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn opening_a_movie_goes_from_loading_to_ready_with_the_fields_filled() {
+    let server = MockServer::start().await;
+    let url = serve_meta_addon(&server, "one", r#""meta""#).await;
+    Mock::given(method("GET"))
+        .and(path("/one/meta/movie/tt1.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(
+                    r#"{"meta": {"id": "tt1", "type": "movie", "name": "A Film",
+                        "poster": "http://x/p.jpg", "background": "http://x/b.jpg",
+                        "description": "It happens.", "releaseInfo": "2010",
+                        "imdbRating": "8.8", "genres": ["Action", "Drama"]}}"#,
+                )
+                .set_delay(Duration::from_millis(300)),
+        )
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    install(&core, url, 1).await;
+
+    core.send(Command::OpenTitle {
+        meta_type: "movie".into(),
+        meta_id: "tt1".into(),
+    });
+    let loading = wait_for(&core, "details open", |s| s.details.is_some()).await;
+    let details = loading.details.as_ref().unwrap();
+    assert_eq!(details.meta_type, "movie");
+    assert_eq!(details.meta_id, "tt1");
+    assert_eq!(details.meta, Load::Loading);
+
+    let state = wait_for(&core, "details settled", details_settled).await;
+    let Load::Ready(meta) = &state.details.as_ref().unwrap().meta else {
+        panic!("not ready: {:?}", state.details)
+    };
+    assert_eq!(meta.id, "tt1");
+    assert_eq!(meta.meta_type, "movie");
+    assert_eq!(meta.name, "A Film");
+    assert_eq!(meta.poster.as_deref(), Some("http://x/p.jpg"));
+    assert_eq!(meta.background.as_deref(), Some("http://x/b.jpg"));
+    assert_eq!(meta.description.as_deref(), Some("It happens."));
+    assert_eq!(meta.release_info.as_deref(), Some("2010"));
+    assert_eq!(meta.rating.as_deref(), Some("8.8"));
+    assert_eq!(meta.genres, ["Action", "Drama"]);
+    // A movie has no videos, so it gets one whose id is the meta id.
+    assert_eq!(meta.videos.len(), 1);
+    assert_eq!(meta.videos[0].id, "tt1");
+    assert_eq!(
+        (meta.videos[0].season, meta.videos[0].episode),
+        (None, None)
+    );
+}
+
+#[tokio::test]
+async fn a_series_returns_its_videos_with_seasons_and_episodes() {
+    let server = MockServer::start().await;
+    let url = serve_meta_addon(&server, "one", r#""meta""#).await;
+    serve_catalog(
+        &server,
+        "/one/meta/series/tt2.json",
+        200,
+        r#"{"meta": {"id": "tt2", "type": "series", "name": "A Show",
+            "videos": [
+                {"id": "tt2:1:1", "title": "Pilot", "season": 1, "episode": 1,
+                 "released": "2011-04-17T00:00:00.000Z"},
+                {"id": "tt2:0:1", "name": "Behind the scenes", "season": 0, "episode": 1},
+                {"id": "tt2:2:3", "title": "Third", "season": 2, "episode": 3}]}}"#,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    install(&core, url, 1).await;
+
+    let meta = open_title(&core, "series", "tt2").await;
+
+    assert_eq!(meta.videos.len(), 3);
+    let pilot = &meta.videos[0];
+    assert_eq!(pilot.id, "tt2:1:1");
+    assert_eq!(pilot.title, "Pilot");
+    assert_eq!((pilot.season, pilot.episode), (Some(1), Some(1)));
+    assert_eq!(pilot.released.as_deref(), Some("2011-04-17T00:00:00.000Z"));
+    // Older addons call the title `name`.
+    assert_eq!(meta.videos[1].title, "Behind the scenes");
+    assert_eq!(meta.videos[1].season, Some(0));
+    assert_eq!(meta.videos[2].episode, Some(3));
+}
+
+#[tokio::test]
+async fn the_addon_whose_id_prefix_matches_is_the_one_asked() {
+    let server = MockServer::start().await;
+    let first = serve_meta_addon(
+        &server,
+        "one",
+        r#"{"name": "meta", "types": ["movie"], "idPrefixes": ["tt"]}"#,
+    )
+    .await;
+    let second = serve_meta_addon(
+        &server,
+        "two",
+        r#"{"name": "meta", "types": ["movie"], "idPrefixes": ["kitsu"]}"#,
+    )
+    .await;
+    for name in ["one", "two"] {
+        serve_catalog(
+            &server,
+            &format!("/{name}/meta/movie/kitsu:7.json"),
+            200,
+            &format!(r#"{{"meta": {{"id": "kitsu:7", "type": "movie", "name": "From {name}"}}}}"#),
+        )
+        .await;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    install(&core, first, 1).await;
+    install(&core, second, 2).await;
+
+    let meta = open_title(&core, "movie", "kitsu:7").await;
+
+    assert_eq!(meta.name, "From two");
+    let asked_first = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|request| request.url.path().starts_with("/one/meta/"));
+    assert!(!asked_first);
+}
+
+#[tokio::test]
+async fn no_matching_addon_gives_failed() {
+    let server = MockServer::start().await;
+    // One **addon** offers `meta` for series only; the other offers no `meta` at all.
+    let series_only =
+        serve_meta_addon(&server, "one", r#"{"name": "meta", "types": ["series"]}"#).await;
+    let catalog_only = serve_addon(&server, "two", "[]").await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    install(&core, series_only, 1).await;
+    install(&core, catalog_only, 2).await;
+
+    core.send(Command::OpenTitle {
+        meta_type: "movie".into(),
+        meta_id: "tt1".into(),
+    });
+    let state = wait_for(&core, "details settled", details_settled).await;
+
+    let Load::Failed(message) = &state.details.as_ref().unwrap().meta else {
+        panic!("not failed: {:?}", state.details)
+    };
+    assert!(message.contains("addon"), "{message}");
+}
+
+#[tokio::test]
+async fn a_failing_request_gives_failed() {
+    let server = MockServer::start().await;
+    let url = serve_meta_addon(&server, "one", r#""meta""#).await;
+    serve_catalog(&server, "/one/meta/movie/tt1.json", 500, "oops").await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    install(&core, url, 1).await;
+
+    core.send(Command::OpenTitle {
+        meta_type: "movie".into(),
+        meta_id: "tt1".into(),
+    });
+    let state = wait_for(&core, "details settled", details_settled).await;
+
+    let Load::Failed(message) = &state.details.as_ref().unwrap().meta else {
+        panic!("not failed: {:?}", state.details)
+    };
+    assert!(message.contains("500"), "{message}");
+}
+
+#[tokio::test]
+async fn closing_the_title_clears_the_details() {
+    let server = MockServer::start().await;
+    let url = serve_meta_addon(&server, "one", r#""meta""#).await;
+    serve_catalog(
+        &server,
+        "/one/meta/movie/tt1.json",
+        200,
+        r#"{"meta": {"id": "tt1", "type": "movie", "name": "A Film"}}"#,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    install(&core, url, 1).await;
+    open_title(&core, "movie", "tt1").await;
+
+    core.send(Command::CloseTitle);
+
+    wait_for(&core, "details gone", |s| s.details.is_none()).await;
+}

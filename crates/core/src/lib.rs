@@ -12,7 +12,7 @@ use std::thread::JoinHandle;
 
 use tokio::sync::{mpsc, oneshot};
 
-pub use addon::types::MetaPreview;
+pub use addon::types::{Meta, MetaPreview, Video};
 pub use posters::Poster;
 
 /// Installed on first launch.
@@ -31,6 +31,13 @@ pub enum Command {
     /// Fetches the catalogs of the installed **addons** again. `Core` also does this by itself
     /// at startup and whenever the installed **addons** change.
     LoadHome,
+    /// Opens the details of a title. Asks the first installed **addon** that offers `meta`
+    /// for this type and id.
+    OpenTitle {
+        meta_type: String,
+        meta_id: String,
+    },
+    CloseTitle,
 }
 
 /// Everything the UI draws. Replaced as a whole after every change.
@@ -40,6 +47,16 @@ pub struct State {
     pub notice: Option<Notice>,
     /// One row for each catalog the installed **addons** offer, in **addon** order.
     pub home: Vec<CatalogRow>,
+    /// The title the person opened, until they close it.
+    pub details: Option<Details>,
+}
+
+/// A title the person opened, and what its **addon** said about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Details {
+    pub meta_type: String,
+    pub meta_id: String,
+    pub meta: Load<Meta>,
 }
 
 /// Something that is being fetched, or has been.

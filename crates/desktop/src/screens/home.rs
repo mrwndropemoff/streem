@@ -3,10 +3,10 @@
 //! Everything here is drawing. Rows come from `State.home`; poster pictures come from
 //! `Core::poster`, which is asked only for posters that are on screen.
 
-use std::collections::HashMap;
-
 use eframe::egui;
-use streem_core::{CatalogRow, Core, Load, MetaPreview, Poster, State};
+use streem_core::{CatalogRow, Core, Load, MetaPreview, State};
+
+use super::Textures;
 
 const POSTER_WIDTH: f32 = 140.0;
 const POSTER_HEIGHT: f32 = 210.0;
@@ -17,26 +17,40 @@ const LOADING_PLACEHOLDERS: usize = 12;
 
 #[derive(Default)]
 pub struct HomeScreen {
-    /// A texture is made from a `Poster` once; this keeps it for every later frame.
-    textures: HashMap<String, egui::TextureHandle>,
+    textures: Textures,
 }
 
 impl HomeScreen {
-    pub fn ui(&mut self, ui: &mut egui::Ui, state: &State, core: &Core) {
+    /// Draws the rows. Returns the title whose poster was clicked this frame, if any.
+    pub fn ui(&mut self, ui: &mut egui::Ui, state: &State, core: &Core) -> Option<MetaPreview> {
+        let mut opened = None;
+        // The scroll position lives under this id, so it is still there when the person comes
+        // back from the details screen.
         egui::ScrollArea::vertical()
+            .id_salt("home")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if state.home.is_empty() {
                     ui.label("No catalogs yet. Install an addon on the Addons screen.");
                 }
                 for (index, row) in state.home.iter().enumerate() {
-                    self.row(ui, index, row, core);
+                    if let Some(item) = self.row(ui, index, row, core) {
+                        opened = Some(item);
+                    }
                     ui.add_space(12.0);
                 }
             });
+        opened
     }
 
-    fn row(&mut self, ui: &mut egui::Ui, index: usize, row: &CatalogRow, core: &Core) {
+    fn row(
+        &mut self,
+        ui: &mut egui::Ui,
+        index: usize,
+        row: &CatalogRow,
+        core: &Core,
+    ) -> Option<MetaPreview> {
+        let mut opened = None;
         ui.horizontal(|ui| {
             ui.heading(&row.catalog_name);
             ui.weak(format!("{} · {}", row.addon_name, row.meta_type));
@@ -68,26 +82,34 @@ impl HomeScreen {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             for item in items {
-                                self.poster(ui, item, core);
+                                if self.poster(ui, item, core) {
+                                    opened = Some(item.clone());
+                                }
                             }
                         });
                     });
             }
         }
+        opened
     }
 
-    fn poster(&mut self, ui: &mut egui::Ui, item: &MetaPreview, core: &Core) {
-        let (rect, _) = ui.allocate_exact_size(
+    /// Draws one poster. Returns true when it was clicked.
+    fn poster(&mut self, ui: &mut egui::Ui, item: &MetaPreview, core: &Core) -> bool {
+        let (rect, response) = ui.allocate_exact_size(
             egui::vec2(POSTER_WIDTH, POSTER_HEIGHT + NAME_HEIGHT),
-            egui::Sense::hover(),
+            egui::Sense::click(),
         );
         // Off screen: no texture, no text and no request to the core.
         if !ui.is_rect_visible(rect) {
-            return;
+            return false;
         }
         let picture_rect = poster_rect(rect);
 
-        match self.texture(ui.ctx(), item, core) {
+        let texture = item
+            .poster
+            .as_deref()
+            .and_then(|url| self.textures.get(ui.ctx(), core, url));
+        match texture {
             Some(texture) => {
                 egui::Image::new(&texture)
                     .fit_to_exact_size(picture_rect.size())
@@ -112,31 +134,11 @@ impl HomeScreen {
             galley,
             text_color,
         );
-    }
 
-    /// The texture of an item's poster, made the first time the poster is ready.
-    fn texture(
-        &mut self,
-        ctx: &egui::Context,
-        item: &MetaPreview,
-        core: &Core,
-    ) -> Option<egui::TextureHandle> {
-        let url = item.poster.as_deref()?;
-        if let Some(texture) = self.textures.get(url) {
-            return Some(texture.clone());
-        }
-        let poster = core.poster(url)?;
-        let texture = ctx.load_texture(url, color_image(&poster), egui::TextureOptions::LINEAR);
-        self.textures.insert(url.to_string(), texture.clone());
-        Some(texture)
+        response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
     }
-}
-
-fn color_image(poster: &Poster) -> egui::ColorImage {
-    egui::ColorImage::from_rgba_unmultiplied(
-        [poster.width as usize, poster.height as usize],
-        &poster.rgba,
-    )
 }
 
 /// The picture's part of a poster's cell; the name goes below it.

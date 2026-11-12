@@ -70,7 +70,7 @@ Streams, playback, library button, continue-watching.
 
 ## Acceptance checks
 
-- [ ] `cargo test -p streem-core` passes, including tests against a `wiremock` server that: `OpenTitle` for a movie reaches `Ready` with the fields filled; a series returns its videos with seasons and episodes; with two **addons** where only the second matches the id prefix, the second is the one queried; no matching **addon** gives `Failed`; `CloseTitle` sets `details` to `None`.
+- [x] `cargo test -p streem-core` passes, including tests against a `wiremock` server that: `OpenTitle` for a movie reaches `Ready` with the fields filled; a series returns its videos with seasons and episodes; with two **addons** where only the second matches the id prefix, the second is the one queried; no matching **addon** gives `Failed`; `CloseTitle` sets `details` to `None`.
 - [ ] `cargo run -p streem-desktop`: clicking a Cinemeta movie poster shows its details; clicking a series shows seasons and episodes; Back returns to Home at the same scroll position.
 
 ## Rules
@@ -84,3 +84,5 @@ Streams, playback, library button, continue-watching.
 - When done, tick the boxes and add a line under `## Comments` saying what you verified and how.
 
 ## Comments
+- Core: `cargo test --workspace` passes, with new wiremock tests for movie details, series videos, addon choice by id prefix, no matching addon, a failing request and `CloseTitle`. `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings` are clean.
+- Desktop: `cargo run -p streem-desktop` starts and runs 25 seconds with no panic. The click-through check (poster opens details, series shows seasons and episodes, Back keeps the Home scroll position) was **not** done by the agent and still needs a human.
