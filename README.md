@@ -8,14 +8,23 @@ Target platforms: Linux (Wayland) and Windows. It is written entirely in Rust.
 
 ## Contents
 
+- [Download it](#download-it)
 - [What you need before running it](#what-you-need-before-running-it)
 - [Run it](#run-it)
 - [Run the tests](#run-the-tests)
+- [CI and releases](#ci-and-releases)
 - [Where your data is stored](#where-your-data-is-stored)
 - [How the project is organised](#how-the-project-is-organised)
 - [What each file does](#what-each-file-does)
 - [Roadmap](#roadmap)
 - [Licence](#licence)
+
+## Download it
+
+Ready-made builds are on the [Releases page](https://github.com/mrwndropemoff/streem/releases).
+
+- **Windows:** download `streem-<version>-windows-x86_64.zip`, unzip it anywhere and double-click `streem-desktop.exe`. libmpv is included. The program is not code-signed, so the first time Windows may say *"Windows protected your PC"*: click **More info**, then **Run anyway**.
+- **Linux:** install libmpv from your distro first (`libmpv2` on Debian/Ubuntu, `mpv` on Arch), then download `streem-<version>-linux-x86_64.tar.gz`, extract it and run `./streem-desktop`. It is built on Ubuntu 24.04, so it needs a distro at least that recent (glibc 2.39, mpv 0.35 or newer).
 
 ## What you need before running it
 
@@ -33,14 +42,17 @@ You do **not** need ffmpeg, Supabase or a Real-Debrid account to run the app as 
 
 ### libmpv on Windows
 
-1. Download the `mpv-dev-x86_64` archive from the Windows builds linked on [mpv.io](https://mpv.io) and extract it, for example to `C:\libmpv`.
-2. From an "x64 Native Tools" prompt in that folder, make an MSVC import library: `lib /def:mpv.def /machine:x64 /out:mpv.lib`.
-3. Tell the linker where it is, in `%USERPROFILE%\.cargo\config.toml`:
+1. Download libmpv and make an MSVC import library (`mpv.lib`) with the same script CI uses. It needs the MSVC build tools and [7-Zip](https://www.7-zip.org), and fetches the exact mpv build that CI is pinned to:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .github\scripts\fetch-libmpv.ps1 -Dest C:\libmpv
+   ```
+   (Doing it by hand: download an `mpv-dev-x86_64` archive from the Windows builds linked on [mpv.io](https://mpv.io) and extract it. Recent archives no longer contain `mpv.def`, so write one from `dumpbin /exports libmpv-2.dll` and run `lib /def:mpv.def /machine:x64 /out:mpv.lib`, as the script does.)
+2. Tell the linker where it is, in `%USERPROFILE%\.cargo\config.toml`:
    ```toml
    [target.x86_64-pc-windows-msvc]
    rustflags = ["-L", "native=C:\\libmpv"]
    ```
-4. After `cargo build`, copy `libmpv-2.dll` next to the program: `target\debug\` (or `target\release\`). Without it, `streem-desktop.exe` and the `streem-desktop` test program do not start.
+3. After `cargo build`, copy `libmpv-2.dll` next to the program: `target\debug\` (or `target\release\`). Without it, `streem-desktop.exe` and the `streem-desktop` test program do not start.
 
 ## Run it
 
@@ -95,6 +107,33 @@ One extra test downloads the real Cinemeta manifest from the internet and is ski
 cargo test -p streem-core -- --ignored
 ```
 
+## CI and releases
+
+GitHub Actions runs three workflows, all in `.github/workflows/`:
+
+| Workflow | When | What it does |
+|---|---|---|
+| `ci.yml` | Every push to `main` and every pull request into `main` | On Linux and Windows: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`. Any formatting difference, clippy warning or failing test turns it red. |
+| `live.yml` | Mondays at 06:00 UTC, or by hand from the Actions tab | Runs the `#[ignore]` tests against the real Cinemeta. A red run means an outside service changed; it never blocks a pull request. |
+| `release.yml` | Pushing a tag such as `v0.1.0` | Builds the Windows zip and the Linux tarball and attaches them to a **draft** GitHub Release. |
+
+CI uses the latest stable Rust, so a new Rust release can bring new clippy warnings; fix them like any other warning. On Windows, CI gets libmpv from `.github/scripts/fetch-libmpv.ps1`, which pins one mpv build by checksum. To move to a newer mpv, follow the note at the top of that script.
+
+### Making a release
+
+1. Set the new version in the root `Cargo.toml` (`[workspace.package] version`), run `cargo check` so `Cargo.lock` follows, and merge that to `main`.
+2. Tag that commit with the same version and push the tag:
+   ```bash
+   git tag v0.1.0
+   ```
+   ```bash
+   git push origin v0.1.0
+   ```
+   The workflow stops if the tag and `Cargo.toml` disagree.
+3. When it finishes, open the draft on the [Releases page](https://github.com/mrwndropemoff/streem/releases), check the two downloads and the notes, and press **Publish release**.
+
+The Windows zip contains `streem-desktop.exe`, `libmpv-2.dll`, this project's `LICENSE` and mpv's licence files. The usual Windows mpv builds are GPL-licensed, so the zip as a whole is distributed under the GPL's terms.
+
 ## Where your data is stored
 
 Streem keeps a single SQLite file, `streem.db`, in its data folder, plus a `posters/` folder with the original poster images it has downloaded, so it never downloads the same poster twice:
@@ -110,13 +149,14 @@ Override it with the `STREEM_DATA_DIR` environment variable (see above). Deletin
 
 ```
 streem/
-├── Cargo.toml              Workspace: lists the two crates, excludes the prototype
+├── .github/                CI and release workflows, and the Windows libmpv script
+├── Cargo.toml              Workspace: lists the two crates, excludes the prototype, sets the version
 ├── crates/
 │   ├── core/               "streem-core": the engine (no UI code)
 │   └── desktop/            "streem-desktop": the egui window
 ├── prototypes/egui-mpv/    Throwaway proof that egui can host libmpv (not part of the build)
 ├── docs/                   Architecture decisions (ADRs) and notes for AI agents
-├── .scratch/v1/            The v1 spec and 22 tickets (the project's issue tracker)
+├── .scratch/v1/            The v1 spec and 23 tickets (the project's issue tracker)
 ├── CONTEXT.md              Glossary of the project's domain terms
 ├── AGENTS.md               Pointers for AI coding agents
 └── LICENSE                 Apache License 2.0
@@ -140,12 +180,21 @@ The central design rule: **the UI never does network or disk work.** `desktop` s
 
 | File | What it does |
 |---|---|
-| `Cargo.toml` | Declares the Cargo workspace with `crates/core` and `crates/desktop`. The prototype is excluded so it never builds with the main app. |
+| `Cargo.toml` | Declares the Cargo workspace with `crates/core` and `crates/desktop`. The prototype is excluded so it never builds with the main app. `[workspace.package] version` is the one version of the app; release tags must match it. |
 | `Cargo.lock` | Exact dependency versions, committed so builds are reproducible. |
 | `.gitignore` | Ignores `target/` (build output) and the prototype's generated `sample/` video. |
 | `CONTEXT.md` | Glossary of the project's vocabulary (Account, Profile, Override, Debrid Service, Download, Watch Party, Addon) and the words to avoid. Use these terms in code and discussion. |
 | `AGENTS.md` | Tells AI coding agents where the issue tracker, triage labels and domain docs live. |
 | `LICENSE` | Apache License 2.0. |
+
+### `.github/` — CI and releases
+
+| File | What it does |
+|---|---|
+| `workflows/ci.yml` | Formatting, clippy and tests on Linux and Windows for every push to `main` and every pull request. |
+| `workflows/live.yml` | Weekly run of the `#[ignore]` tests that use the real Cinemeta. |
+| `workflows/release.yml` | On a `v*` tag: checks the tag matches `Cargo.toml`, builds the Windows zip and Linux tarball, and creates a draft GitHub Release with them. |
+| `scripts/fetch-libmpv.ps1` | Downloads the pinned Windows mpv build, checks its SHA-256, makes `mpv.lib` from the DLL's exports and fetches mpv's licence files. In Actions it also puts the folder on `PATH` and sets `RUSTFLAGS`. Works on a developer machine too. |
 
 ### `crates/core` — the engine (`streem-core`)
 
@@ -214,7 +263,7 @@ cargo run --release -- sample/sample.mkv
 | File | What it does |
 |---|---|
 | `spec.md` | The v1 specification: what the app is, key decisions, the two-crate rule, accounts/profiles/overrides, Real-Debrid via addons, sync, watch parties, build order and open risks. **Read this first** to understand where the project is going. |
-| `issues/01` … `issues/22` | One ticket per piece of work, each with a `Status:` line (e.g. `ready-for-agent`, `ready-for-human`). Tickets 01 to 07 have been worked on (their `Status:` lines may lag behind the code); the rest are the backlog. |
+| `issues/01` … `issues/23` | One ticket per piece of work, each with a `Status:` line (e.g. `ready-for-agent`, `ready-for-human`). Tickets 01 to 07 have been worked on (their `Status:` lines may lag behind the code); the rest are the backlog. |
 
 ## Roadmap
 

@@ -1,0 +1,113 @@
+name: Release
+
+# Pushing a tag such as `v0.1.0` builds the Windows and Linux downloads and
+# attaches them to a *draft* GitHub Release. Check the draft, then press
+# Publish on GitHub. See "Making a release" in the README.
+#
+# A pull request that changes this file or the libmpv script runs it as a dry
+# run: it builds and uploads both packages as workflow artifacts, but skips the
+# tag check and creates no release.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/scripts/**
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: check
+        run: |
+          cargo_version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "streem-desktop") | .version')
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$cargo_version" != "$tag_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the version in Cargo.toml ($cargo_version)"
+            exit 1
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+          # libmpv2 needs mpv 0.35 or newer (libmpv.so.2); Ubuntu 22.04 only
+          # has 0.34, so 24.04 is the oldest runner that can build it.
+          - name: linux-x86_64
+            os: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    env:
+      PACKAGE: streem-${{ needs.version.outputs.version }}-${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install libmpv (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libmpv-dev libxkbcommon-dev libwayland-dev
+      - name: Install libmpv (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .github/scripts/fetch-libmpv.ps1 -Dest "$env:RUNNER_TEMP\libmpv"
+
+      - run: cargo build --release --locked -p streem-desktop
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "$env:RUNNER_TEMP\$env:PACKAGE"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item target\release\streem-desktop.exe, LICENSE $dir
+          Copy-Item "$env:RUNNER_TEMP\libmpv\libmpv-2.dll", "$env:RUNNER_TEMP\libmpv\mpv-*.txt" $dir
+          Compress-Archive -Path $dir -DestinationPath "$env:PACKAGE.zip"
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir "$RUNNER_TEMP/$PACKAGE"
+          cp target/release/streem-desktop LICENSE "$RUNNER_TEMP/$PACKAGE/"
+          tar -czf "$PACKAGE.tar.gz" -C "$RUNNER_TEMP" "$PACKAGE"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PACKAGE }}
+          path: ${{ env.PACKAGE }}.*
+          if-no-files-found: error
+
+  release:
+    name: Draft GitHub Release
+    needs: [version, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft --verify-tag --generate-notes \
+            --title "Streem ${{ needs.version.outputs.version }}"

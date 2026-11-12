@@ -1,0 +1,24 @@
+name: Live addon tests
+
+# The `#[ignore]` tests that talk to real services on the internet (the real
+# Cinemeta). They never block a PR; a red run here means an outside service
+# changed, not that our code did. Run by hand from the Actions tab too.
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p streem-core --locked -- --ignored
