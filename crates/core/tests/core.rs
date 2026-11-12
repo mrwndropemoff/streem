@@ -1566,3 +1566,326 @@ async fn the_link_never_shows_up_in_debug_output() {
     assert!(!format!("{state:?}").contains("cdn.example"));
     assert!(!format!("{:?}", playback(&state)).contains("cdn.example"));
 }
+
+// ---- Search ---------------------------------------------------------------------------------
+
+fn search_settled(state: &State, query: &str) -> bool {
+    state.search.as_ref().is_some_and(|search| {
+        search.query == query
+            && search
+                .rows
+                .iter()
+                .all(|row| !matches!(row.items, Load::Loading))
+    })
+}
+
+async fn search(core: &Core, query: &str) -> std::sync::Arc<State> {
+    core.send(Command::Search {
+        query: query.into(),
+    });
+    wait_for(core, "search settled", |s| search_settled(s, query)).await
+}
+
+/// Paths of every catalog request the server got, as sent (still percent-encoded).
+async fn catalog_requests(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|request| request.url.path().to_string())
+        .filter(|request_path| request_path.contains("/catalog/"))
+        .collect()
+}
+
+#[tokio::test]
+async fn only_catalogs_declaring_the_search_extra_are_searched() {
+    let server = MockServer::start().await;
+    let url = serve_addon(
+        &server,
+        "one",
+        r#"[{"type": "movie", "id": "top", "name": "Popular", "extra": [{"name": "skip"}]},
+            {"type": "movie", "id": "find", "name": "Movies", "extra": [{"name": "search"}]},
+            {"type": "series", "id": "only", "name": "Shows",
+             "extra": [{"name": "search", "isRequired": true}]},
+            {"type": "movie", "id": "genre", "name": "By genre",
+             "extra": [{"name": "search"}, {"name": "genre", "isRequired": true}]}]"#,
+    )
+    .await;
+    serve_json(
+        &server,
+        "/one/catalog/movie/top.json",
+        200,
+        r#"{"metas": []}"#,
+    )
+    .await;
+    serve_json(
+        &server,
+        "/one/catalog/movie/find/search=matrix.json",
+        200,
+        r#"{"metas": [{"id": "tt1", "type": "movie", "name": "The Matrix"}]}"#,
+    )
+    .await;
+    serve_json(
+        &server,
+        "/one/catalog/series/only/search=matrix.json",
+        200,
+        r#"{"metas": []}"#,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    install(&core, url, 1).await;
+
+    let state = search(&core, "matrix").await;
+
+    let search = state.search.as_ref().unwrap();
+    let names: Vec<&str> = search
+        .rows
+        .iter()
+        .map(|row| row.catalog_name.as_str())
+        .collect();
+    assert_eq!(names, ["Movies", "Shows"]);
+    let Load::Ready(items) = &search.rows[0].items else {
+        panic!("not ready: {:?}", search.rows[0].items)
+    };
+    assert_eq!(items[0].name, "The Matrix");
+    assert_eq!(search.rows[1].items, Load::Ready(Vec::new()));
+    let searched: Vec<String> = catalog_requests(&server)
+        .await
+        .into_iter()
+        .filter(|request_path| request_path.contains("search="))
+        .collect();
+    assert_eq!(searched.len(), 2, "{searched:?}");
+    assert!(
+        !searched
+            .iter()
+            .any(|p| p.contains("/top/") || p.contains("/genre/"))
+    );
+}
+
+#[tokio::test]
+async fn the_query_is_sent_percent_encoded() {
+    let server = MockServer::start().await;
+    let url = serve_addon(
+        &server,
+        "one",
+        r#"[{"type": "movie", "id": "find", "name": "Movies", "extra": [{"name": "search", "isRequired": true}]}]"#,
+    )
+    .await;
+    serve_json(
+        &server,
+        "/one/catalog/movie/find/search=the%20wire.json",
+        200,
+        r#"{"metas": [{"id": "tt2", "type": "movie", "name": "The Wire"}]}"#,
+    )
+    .await;
+    // Left raw, `&` and `/` would change the request, so this one fails unless it is encoded.
+    serve_json(
+        &server,
+        "/one/catalog/movie/find/search=law%20%26%20order%2Fsvu.json",
+        200,
+        r#"{"metas": [{"id": "tt3", "type": "series", "name": "Law & Order: SVU"}]}"#,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    install(&core, url, 1).await;
+
+    for query in ["the wire", "law & order/svu"] {
+        let state = search(&core, query).await;
+
+        let rows = &state.search.as_ref().unwrap().rows;
+        assert!(
+            matches!(&rows[0].items, Load::Ready(items) if items.len() == 1),
+            "{query}: {rows:?}"
+        );
+    }
+    let searched: Vec<String> = catalog_requests(&server).await;
+    assert!(
+        searched.contains(&"/one/catalog/movie/find/search=the%20wire.json".to_string()),
+        "{searched:?}"
+    );
+}
+
+#[tokio::test]
+async fn results_of_a_superseded_query_never_appear() {
+    let server = MockServer::start().await;
+    let url = serve_addon(
+        &server,
+        "one",
+        r#"[{"type": "movie", "id": "find", "name": "Movies", "extra": [{"name": "search"}]}]"#,
+    )
+    .await;
+    serve_json(
+        &server,
+        "/one/catalog/movie/find.json",
+        200,
+        r#"{"metas": []}"#,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/one/catalog/movie/find/search=first.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"metas": [{"id": "tt1", "type": "movie", "name": "First"}]}"#)
+                .set_delay(Duration::from_millis(400)),
+        )
+        .mount(&server)
+        .await;
+    serve_json(
+        &server,
+        "/one/catalog/movie/find/search=second.json",
+        200,
+        r#"{"metas": [{"id": "tt2", "type": "movie", "name": "Second"}]}"#,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    install(&core, url, 1).await;
+
+    core.send(Command::Search {
+        query: "first".into(),
+    });
+    search(&core, "second").await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    let state = core.state();
+    let search = state.search.as_ref().unwrap();
+    assert_eq!(search.query, "second");
+    let Load::Ready(items) = &search.rows[0].items else {
+        panic!("not ready: {:?}", search.rows[0].items)
+    };
+    let names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
+    assert_eq!(names, ["Second"]);
+}
+
+#[tokio::test]
+async fn an_empty_query_clears_the_search() {
+    let server = MockServer::start().await;
+    let url = serve_addon(
+        &server,
+        "one",
+        r#"[{"type": "movie", "id": "find", "name": "Movies", "extra": [{"name": "search", "isRequired": true}]}]"#,
+    )
+    .await;
+    serve_json(
+        &server,
+        "/one/catalog/movie/find/search=matrix.json",
+        200,
+        r#"{"metas": []}"#,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    install(&core, url, 1).await;
+    for empty in ["", "   "] {
+        search(&core, "matrix").await;
+
+        core.send(Command::Search {
+            query: empty.into(),
+        });
+        wait_for(&core, "search cleared", |s| s.search.is_none()).await;
+    }
+}
+
+#[tokio::test]
+async fn clear_search_removes_the_results() {
+    let server = MockServer::start().await;
+    let url = serve_addon(
+        &server,
+        "one",
+        r#"[{"type": "movie", "id": "find", "name": "Movies", "extra": [{"name": "search", "isRequired": true}]}]"#,
+    )
+    .await;
+    serve_json(
+        &server,
+        "/one/catalog/movie/find/search=matrix.json",
+        200,
+        r#"{"metas": []}"#,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    install(&core, url, 1).await;
+    search(&core, "matrix").await;
+
+    core.send(Command::ClearSearch);
+    wait_for(&core, "search cleared", |s| s.search.is_none()).await;
+}
+
+#[tokio::test]
+async fn results_arriving_after_clear_search_never_appear() {
+    let server = MockServer::start().await;
+    let url = serve_addon(
+        &server,
+        "one",
+        r#"[{"type": "movie", "id": "find", "name": "Movies", "extra": [{"name": "search"}]}]"#,
+    )
+    .await;
+    serve_json(
+        &server,
+        "/one/catalog/movie/find.json",
+        200,
+        r#"{"metas": []}"#,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/one/catalog/movie/find/search=late.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"metas": [{"id": "tt1", "type": "movie", "name": "Late"}]}"#)
+                .set_delay(Duration::from_millis(400)),
+        )
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    install(&core, url, 1).await;
+
+    core.send(Command::Search {
+        query: "late".into(),
+    });
+    wait_for(&core, "search started", |s| s.search.is_some()).await;
+    core.send(Command::ClearSearch);
+    wait_for(&core, "search cleared", |s| s.search.is_none()).await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    assert!(core.state().search.is_none());
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/one/catalog/movie/find/search=late.json")
+            .count(),
+        1,
+        "the late search request was sent"
+    );
+}
+
+/// Needs internet access: `cargo test -p streem-core -- --ignored`.
+#[tokio::test]
+#[ignore]
+async fn searching_the_real_cinemeta_gives_movie_and_series_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    install(
+        &core,
+        "https://v3-cinemeta.strem.io/manifest.json".into(),
+        1,
+    )
+    .await;
+
+    let state = search(&core, "matrix").await;
+
+    let rows = &state.search.as_ref().unwrap().rows;
+    let with_results: Vec<&str> = rows
+        .iter()
+        .filter(|row| matches!(&row.items, Load::Ready(items) if !items.is_empty()))
+        .map(|row| row.meta_type.as_str())
+        .collect();
+    assert!(with_results.contains(&"movie"), "{rows:?}");
+    assert!(with_results.contains(&"series"), "{rows:?}");
+}

@@ -53,8 +53,8 @@ Search-as-you-type, search history, filters.
 
 ## Acceptance checks
 
-- [ ] `cargo test -p streem-core` passes, including tests against a `wiremock` server that: only the catalog declaring the `search` extra is queried; the query `the wire` is sent percent-encoded; results from a superseded query never appear in `State.search`; an empty query sets `search` to `None`.
-- [ ] `cargo run -p streem-desktop`: searching "matrix" shows Cinemeta movie and series rows.
+- [x] `cargo test -p streem-core` passes, including tests against a `wiremock` server that: only the catalog declaring the `search` extra is queried; the query `the wire` is sent percent-encoded; results from a superseded query never appear in `State.search`; an empty query sets `search` to `None`.
+- [x] `cargo run -p streem-desktop`: searching "matrix" shows Cinemeta movie and series rows.
 
 ## Rules
 
@@ -67,3 +67,6 @@ Search-as-you-type, search history, filters.
 - When done, tick the boxes and add a line under `## Comments` saying what you verified and how.
 
 ## Comments
+
+- Agent (2026-11-12): `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` pass. New wiremock tests in `crates/core/tests/core.rs`: `only_catalogs_declaring_the_search_extra_are_searched`, `the_query_is_sent_percent_encoded` (`the wire` → `the%20wire`, plus `law & order/svu`, which only matches when `&` and `/` are encoded), `results_of_a_superseded_query_never_appear`, `an_empty_query_clears_the_search` (`""` and `"   "`), `clear_search_removes_the_results`. The ignored `searching_the_real_cinemeta_gives_movie_and_series_rows` passed against the real Cinemeta (`cargo test -p streem-core -- --ignored searching_the_real`), so core returns movie and series rows for "matrix". The second box is NOT ticked: the agent could not drive the desktop window, so the search box and screen in `cargo run -p streem-desktop` still need a human check.
+- Human (2026-11-12): searched "matrix" in `cargo run -p streem-desktop` and confirmed it works; second box ticked.

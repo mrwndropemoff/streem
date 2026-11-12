@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::addon::client::{
     catalog_url, fetch_catalog, fetch_manifest, fetch_meta, fetch_streams, http_client, meta_url,
-    normalize_url, parse_manifest, stream_url,
+    normalize_url, parse_manifest, search_url, stream_url,
 };
 use crate::addon::types::{
     Manifest, ManifestCatalog, Meta, MetaPreview, Stream, StreamSource, is_http,
@@ -22,8 +22,8 @@ use crate::playback::{self, Links, Reported};
 use crate::posters::{self, Poster, PosterCache};
 use crate::store::{Store, StoreError, StoredAddon};
 use crate::{
-    CatalogRow, Command, Details, InstalledAddon, Load, Notice, State, StreamGroup, StreamItem,
-    StreamList,
+    CatalogRow, Command, Details, InstalledAddon, Load, Notice, Search, State, StreamGroup,
+    StreamItem, StreamList,
 };
 
 /// Position-only reports from the player are published at most this often.
@@ -44,9 +44,11 @@ pub(crate) enum Message {
     LoadPoster(String),
     /// A poster finished loading, or could not be.
     PosterLoaded(String, Result<Poster, String>),
-    /// A home row finished loading. Ignored when `generation` is not the latest one, which means
-    /// the rows were rebuilt since the request was made.
+    /// A home or search row finished loading. Ignored when `generation` is not the latest one
+    /// for that list, which means its rows were rebuilt (or the search was cleared) since the
+    /// request was made.
     Catalog {
+        list: RowList,
         generation: u64,
         row: usize,
         result: Result<Vec<MetaPreview>, String>,
@@ -66,11 +68,20 @@ pub(crate) enum Message {
     },
 }
 
+/// Which rows a [`Message::Catalog`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowList {
+    Home,
+    Search,
+}
+
 /// The **addon** list as saved, after a disk job.
 pub(crate) struct StoreOutput {
     addons: Vec<InstalledAddon>,
     /// The catalogs the home screen can show, from the saved manifests.
     catalogs: Vec<CatalogSource>,
+    /// The catalogs a search asks, from the saved manifests.
+    search_catalogs: Vec<CatalogSource>,
     /// The saved manifests, by **addon** URL, in **addon** order. Used to pick who answers a
     /// meta request.
     manifests: Vec<(String, Manifest)>,
@@ -78,7 +89,7 @@ pub(crate) struct StoreOutput {
     first_launch: bool,
 }
 
-/// A catalog that gets a row on the home screen, with the **addon** that offers it.
+/// A catalog that gets a row on the home or search screen, with the **addon** that offers it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CatalogSource {
     addon_url: String,
@@ -123,6 +134,9 @@ impl App {
         // What the home rows were built from, and which build the running fetches belong to.
         let mut catalogs: Vec<CatalogSource> = Vec::new();
         let mut home_generation = 0;
+        // The same for the search rows.
+        let mut search_catalogs: Vec<CatalogSource> = Vec::new();
+        let mut search_generation = 0;
         // The manifests of the installed **addons**, and which open title the running fetch
         // belongs to.
         let mut manifests: Vec<(String, Manifest)> = Vec::new();
@@ -167,18 +181,43 @@ impl App {
                     (self.on_change)();
                 }
                 Message::Catalog {
+                    list,
                     generation,
                     row,
                     result,
                 } => {
-                    if generation == home_generation
-                        && let Some(row) = state.home.get_mut(row)
-                    {
+                    let rows = match list {
+                        RowList::Home if generation == home_generation => Some(&mut state.home),
+                        RowList::Search if generation == search_generation => {
+                            state.search.as_mut().map(|search| &mut search.rows)
+                        }
+                        _ => None,
+                    };
+                    if let Some(row) = rows.and_then(|rows| rows.get_mut(row)) {
                         row.items = match result {
                             Ok(items) => Load::Ready(items),
                             Err(text) => Load::Failed(text),
                         };
                     }
+                }
+                Message::Command(Command::Search { query }) => {
+                    search_generation += 1;
+                    let query = query.trim();
+                    state.search = (!query.is_empty()).then(|| Search {
+                        query: query.to_string(),
+                        rows: start_rows(
+                            &client,
+                            &self.sender,
+                            &search_catalogs,
+                            Some(query),
+                            RowList::Search,
+                            search_generation,
+                        ),
+                    });
+                }
+                Message::Command(Command::ClearSearch) => {
+                    search_generation += 1;
+                    state.search = None;
                 }
                 Message::Command(Command::OpenTitle { meta_type, meta_id }) => {
                     details_generation += 1;
@@ -316,6 +355,7 @@ impl App {
                     state.addons = output.addons;
                     // Every finished disk job is a startup load, an install or a removal.
                     catalogs = output.catalogs;
+                    search_catalogs = output.search_catalogs;
                     manifests = output.manifests;
                     reload_home = true;
                     if output.first_launch {
@@ -329,7 +369,14 @@ impl App {
 
             if reload_home {
                 home_generation += 1;
-                state.home = start_home(&client, &self.sender, &catalogs, home_generation);
+                state.home = start_rows(
+                    &client,
+                    &self.sender,
+                    &catalogs,
+                    None,
+                    RowList::Home,
+                    home_generation,
+                );
             }
 
             for input in to_install {
@@ -406,12 +453,15 @@ fn spawn_download(
     });
 }
 
-/// Builds a `Loading` row for each catalog and fetches them all at once. Each row is answered
-/// on its own, so one failing **addon** never touches the others.
-fn start_home(
+/// Builds a `Loading` row for each catalog and fetches them all at once: the catalog itself,
+/// or with a `query` a search in it. Each row is answered on its own, so one failing **addon**
+/// never touches the others.
+fn start_rows(
     client: &reqwest::Client,
     sender: &mpsc::UnboundedSender<Message>,
     catalogs: &[CatalogSource],
+    query: Option<&str>,
+    list: RowList,
     generation: u64,
 ) -> Vec<CatalogRow> {
     let mut rows = Vec::with_capacity(catalogs.len());
@@ -427,13 +477,19 @@ fn start_home(
         let sender = sender.clone();
         let addon_url = source.addon_url.clone();
         let catalog = source.catalog.clone();
+        let query = query.map(str::to_string);
         tokio::spawn(async move {
-            let result = match catalog_url(&addon_url, &catalog.kind, &catalog.id) {
+            let url = match &query {
+                Some(query) => search_url(&addon_url, &catalog.kind, &catalog.id, query),
+                None => catalog_url(&addon_url, &catalog.kind, &catalog.id),
+            };
+            let result = match url {
                 Ok(url) => fetch_catalog(&client, &url).await,
                 Err(error) => Err(error),
             };
             let result = result.map_err(|error| error.to_string());
             let _ = sender.send(Message::Catalog {
+                list,
                 generation,
                 row,
                 result,
@@ -603,18 +659,23 @@ fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
     }
     let mut addons = Vec::new();
     let mut catalogs = Vec::new();
+    let mut search_catalogs = Vec::new();
     let mut manifests = Vec::new();
     for stored in store.list_addons()? {
         let Some((addon, manifest)) = installed_addon(stored) else {
             continue;
         };
         for catalog in &manifest.catalogs {
+            let source = || CatalogSource {
+                addon_url: addon.url.clone(),
+                addon_name: addon.name.clone(),
+                catalog: catalog.clone(),
+            };
             if !catalog.has_required_extra() {
-                catalogs.push(CatalogSource {
-                    addon_url: addon.url.clone(),
-                    addon_name: addon.name.clone(),
-                    catalog: catalog.clone(),
-                });
+                catalogs.push(source());
+            }
+            if catalog.supports_search() {
+                search_catalogs.push(source());
             }
         }
         manifests.push((addon.url.clone(), manifest));
@@ -623,6 +684,7 @@ fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
     Ok(StoreOutput {
         addons,
         catalogs,
+        search_catalogs,
         manifests,
         first_launch,
     })
