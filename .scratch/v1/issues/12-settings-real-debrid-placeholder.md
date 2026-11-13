@@ -85,10 +85,10 @@ Calling the Real-Debrid API, per-**profile** **overrides** (ticket 19), sync, ot
 
 ## Acceptance checks
 
-- [ ] `cargo test -p streem-core` passes, including tests that: `resolve` fills the placeholder; fills the percent-encoded spelling; percent-encodes a key containing `/`; returns the template unchanged when there is no placeholder; returns `MissingKey` with a placeholder and no key; against a `wiremock` server, a templated **addon** is requested at the path containing the key; with no key the server receives zero requests and `skipped_reason` is set; setting a key afterwards clears `skipped_reason` and triggers the manifest request; installing a URL that contains the saved key stores the placeholder instead.
-- [ ] A test captures everything logged during a templated request and asserts the key does not appear.
-- [ ] `grep -rn "format!.*manifest\|/catalog/\|/stream/\|/meta/\|/subtitles/" crates/core/src --include=*.rs` shows these paths built only in `addon/client.rs`, after a call to `resolve`.
-- [ ] Settings survive a restart.
+- [x] `cargo test -p streem-core` passes, including tests that: `resolve` fills the placeholder; fills the percent-encoded spelling; percent-encodes a key containing `/`; returns the template unchanged when there is no placeholder; returns `MissingKey` with a placeholder and no key; against a `wiremock` server, a templated **addon** is requested at the path containing the key; with no key the server receives zero requests and `skipped_reason` is set; setting a key afterwards clears `skipped_reason` and triggers the manifest request; installing a URL that contains the saved key stores the placeholder instead.
+- [x] A test captures everything logged during a templated request and asserts the key does not appear.
+- [x] `grep -rn "format!.*manifest\|/catalog/\|/stream/\|/meta/\|/subtitles/" crates/core/src --include=*.rs` shows these paths built only in `addon/client.rs`, after a call to `resolve`.
+- [x] Settings survive a restart.
 
 ## Human check
 
@@ -106,3 +106,9 @@ Calling the Real-Debrid API, per-**profile** **overrides** (ticket 19), sync, ot
 - When done, tick the boxes and add a line under `## Comments` saying what you verified and how.
 
 ## Comments
+
+- Verified 2026-11-13 with `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`, all passing. Covered by: unit tests in `addon/url.rs` (`resolve`, both spellings, a key with `/`, no placeholder, `MissingKey`, `templatize`), `store.rs` and `settings.rs` (`Debug` hides the key); the "Real-Debrid key placeholder" section of `tests/core.rs` (path with the key, zero requests and `skipped_reason` without a key, saving a key fetches the manifest and reloads home, clearing it skips the **addon** for catalogs and streams while others keep working, install convenience, an install sent right after the key, retry on restart after a failed fetch, settings survive a restart). The grep shows the paths only in `addon/client.rs`; `ResolvedAddon::resolve` (which calls `url::resolve`) is the only way to build a request there.
+- `tests/secrets.rs` installs a Trace-level `log` logger before `Core` starts; `tracing` is a dev-dependency with its `log` feature, so `hyper_util` events are captured as well as `reqwest`'s. It runs a templated install, catalog, meta and a failing stream request, plus an install against a closed port, then asserts the key appears in no record, notice or `{:?}` of the state, and that records from `reqwest` and `hyper_util` were captured. reqwest errors go through `without_url()`.
+- Design choices: a placeholder **addon** installed with no key is stored with an empty manifest and listed as skipped; its manifest is fetched when a key is saved, and again at startup if that fetch failed. Settings change in `State` at once and are saved by the disk worker after.
+- Failed streams: an **addon**-resolved link is played through the same `Playback` path as any link, so ticket 07's failed-report tests cover it; not run against a real Torrentio link.
+- Not done: the human checks below need a real Real-Debrid key and were not run. `Command` still derives `Debug`, so `{:?}` of `SetRealDebridKey` would print the key; nothing prints commands. With `sid=auto`, mpv may not auto-select an **addon** subtitle in the chosen language, because those are added with `sub-add … auto`; not checked in mpv.

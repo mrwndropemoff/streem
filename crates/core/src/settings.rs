@@ -36,7 +36,7 @@ impl std::fmt::Debug for Settings {
 }
 
 /// What was typed, without surrounding whitespace; blank becomes `None`.
-pub(crate) fn clean(value: Option<String>) -> Option<String> {
+pub(crate) fn non_blank(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -66,7 +66,7 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(settings.key(), None);
-        assert_eq!(clean(Some("  abc ".into())), Some("abc".into()));
-        assert_eq!(clean(Some(" ".into())), None);
+        assert_eq!(non_blank(Some("  abc ".into())), Some("abc".into()));
+        assert_eq!(non_blank(Some(" ".into())), None);
     }
 }

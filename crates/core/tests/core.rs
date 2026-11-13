@@ -2254,6 +2254,57 @@ async fn clearing_the_key_skips_the_templated_addon_and_leaves_the_others_workin
 }
 
 #[tokio::test]
+async fn an_install_sent_right_after_the_key_already_uses_it() {
+    let server = MockServer::start().await;
+    serve_debrid_addon(&server, KEY).await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    wait_for(&core, "startup load", |s| s.home.is_empty()).await;
+
+    core.send(Command::SetRealDebridKey(Some(KEY.into())));
+    core.send(Command::InstallAddon {
+        url: format!("{}/realdebrid={KEY}/manifest.json", server.uri()),
+    });
+    let state = wait_for(&core, "installed", debrid_ready).await;
+
+    assert_eq!(state.addons[0].url, debrid_template(&server));
+}
+
+#[tokio::test]
+async fn a_manifest_that_failed_to_fetch_is_fetched_again_on_restart() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/realdebrid={KEY}/manifest.json")))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    serve_debrid_addon(&server, KEY).await;
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let core = start(dir.path());
+        core.send(Command::InstallAddon {
+            url: debrid_template(&server),
+        });
+        wait_for(&core, "listed", |s| s.addons.len() == 1).await;
+        set_key(&core, Some(KEY)).await;
+        let state = wait_for(&core, "the fetch failed", |s| s.notice.is_some()).await;
+        let notice = &state.notice.as_ref().unwrap().text;
+        assert!(notice.contains("Could not refresh"), "{notice}");
+        assert!(!notice.contains(KEY), "{notice}");
+        assert_eq!(state.addons.len(), 1, "the addon stays listed");
+    }
+
+    let core = start(dir.path());
+    let state = wait_for(&core, "fetched on restart", |s| {
+        debrid_ready(s) && rows_settled(s, 1)
+    })
+    .await;
+    assert_eq!(state.addons[0].id, "org.example.debrid");
+}
+
+#[tokio::test]
 async fn installing_a_url_holding_the_saved_key_stores_the_placeholder() {
     let server = MockServer::start().await;
     serve_debrid_addon(&server, KEY).await;

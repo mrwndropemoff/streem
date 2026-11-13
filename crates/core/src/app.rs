@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::addon::client::{
-    AddonBase, fetch_catalog, fetch_manifest, fetch_meta, fetch_streams, fetch_subtitles,
+    ResolvedAddon, fetch_catalog, fetch_manifest, fetch_meta, fetch_streams, fetch_subtitles,
     http_client, normalize_url, parse_manifest,
 };
 use crate::addon::types::{
@@ -84,14 +84,14 @@ pub(crate) enum RowList {
     Search,
 }
 
-/// The **addon** list and the settings as saved, after a disk job.
+/// The **addon** list as saved, after a disk job.
 pub(crate) struct StoreOutput {
+    /// `skipped_reason` is not set yet; the task sets it from its own settings.
     addons: Vec<InstalledAddon>,
-    settings: Settings,
+    /// The saved settings, read by the startup load only.
+    settings: Option<Settings>,
     /// The job was a startup load, an install or a removal.
     addons_changed: bool,
-    /// The job saved a Real-Debrid key different from the one saved before.
-    key_changed: bool,
     /// The catalogs the home screen can show, from the saved manifests.
     catalogs: Vec<CatalogSource>,
     /// The catalogs a search asks, from the saved manifests.
@@ -180,6 +180,10 @@ impl App {
         let mut last_report_published: Option<Instant> = None;
         // When a held-back position must be published, if the player sends nothing before then.
         let mut held_back_until: Option<Instant> = None;
+        // The person changed the key, or the languages, before the startup load finished;
+        // the saved value it brings is then older and is not used.
+        let mut key_set = false;
+        let mut languages_set = false;
 
         loop {
             // The future is built even when the branch is off, so it needs some instant.
@@ -196,6 +200,10 @@ impl App {
             let mut to_install = Vec::new();
             // Installed **addons** whose manifest is fetched again, by stored URL.
             let mut to_refresh = Vec::new();
+            // A Real-Debrid key was saved: whether it differs from the one before.
+            let mut key_saved = None;
+            // The startup load finished.
+            let mut first_load = false;
             let mut reload_home = false;
             // Set when the state changed only by a position nobody needs to hear about yet.
             let mut hold_back = false;
@@ -391,16 +399,29 @@ impl App {
                     let _ = jobs.send(StoreJob::Remove { url });
                 }
                 Message::Command(Command::DismissNotice) => state.notice = None,
-                // Settings change in `State` once they are saved, so the state always shows
-                // what is on disk.
-                Message::Command(Command::SetRealDebridKey(key)) => {
-                    let _ = jobs.send(StoreJob::SaveRealDebridKey(settings::clean(key)));
-                }
-                Message::Command(Command::SetPlaybackLanguages { audio, subtitle }) => {
-                    let _ = jobs.send(StoreJob::SaveLanguages {
-                        audio: settings::clean(audio),
-                        subtitle: settings::clean(subtitle),
-                    });
+                // A setting changes in `State` at once, so a command right after it, such as
+                // an install, already uses it; the save follows on the disk worker.
+                Message::Command(
+                    command @ (Command::SetRealDebridKey(_) | Command::SetPlaybackLanguages { .. }),
+                ) => {
+                    let Some(job) = save_settings_job(command) else {
+                        continue;
+                    };
+                    match &job {
+                        StoreJob::SaveRealDebridKey(key) => {
+                            key_set = true;
+                            let changed = state.settings.key() != key.as_deref();
+                            state.settings.real_debrid_key = key.clone();
+                            key_saved = Some(changed);
+                        }
+                        StoreJob::SaveLanguages { audio, subtitle } => {
+                            languages_set = true;
+                            state.settings.audio_lang = audio.clone();
+                            state.settings.subtitle_lang = subtitle.clone();
+                        }
+                        _ => {}
+                    }
+                    let _ = jobs.send(job);
                 }
                 Message::Fetched(id, result) => {
                     // Not in the map: the **addon** was removed while it was downloading.
@@ -416,23 +437,23 @@ impl App {
                     }
                 }
                 Message::Stored(Ok(output)) => {
+                    if let Some(saved) = output.settings {
+                        first_load = true;
+                        // A setting changed before the startup load finished is newer.
+                        if !key_set {
+                            state.settings.real_debrid_key = saved.real_debrid_key;
+                        }
+                        if !languages_set {
+                            state.settings.audio_lang = saved.audio_lang;
+                            state.settings.subtitle_lang = saved.subtitle_lang;
+                        }
+                    }
                     state.addons = output.addons;
-                    state.settings = output.settings;
+                    mark_skipped(&mut state.addons, &state.settings);
                     catalogs = output.catalogs;
                     search_catalogs = output.search_catalogs;
                     manifests = output.manifests;
-                    reload_home = output.addons_changed || output.key_changed;
-                    if output.key_changed {
-                        // With a key, the **addons** that need one can answer now; without
-                        // one they are skipped, and there is nothing to fetch.
-                        to_refresh.extend(
-                            state
-                                .addons
-                                .iter()
-                                .filter(|addon| has_placeholder(&addon.url))
-                                .map(|addon| addon.url.clone()),
-                        );
-                    }
+                    reload_home = output.addons_changed;
                     if output.first_launch {
                         to_install.extend(self.default_addon_urls.iter().cloned());
                     }
@@ -440,6 +461,32 @@ impl App {
                 Message::Stored(Err(text)) => {
                     state.notice = Some(notice(&mut next_notice_id, text));
                 }
+            }
+
+            if let Some(changed) = key_saved {
+                mark_skipped(&mut state.addons, &state.settings);
+                if changed {
+                    // With a key, the **addons** that need one can answer now; without one
+                    // they are skipped, and there is nothing to fetch.
+                    reload_home = true;
+                    to_refresh.extend(
+                        state
+                            .addons
+                            .iter()
+                            .filter(|addon| has_placeholder(&addon.url))
+                            .map(|addon| addon.url.clone()),
+                    );
+                }
+            }
+            if key_saved.is_some() || first_load {
+                // Also a retry for an **addon** whose manifest could not be fetched before.
+                to_refresh.extend(
+                    state
+                        .addons
+                        .iter()
+                        .filter(|addon| !manifests.iter().any(|(url, _)| *url == addon.url))
+                        .map(|addon| addon.url.clone()),
+                );
             }
 
             if reload_home {
@@ -466,12 +513,13 @@ impl App {
                         continue;
                     }
                 };
-                match AddonBase::resolve(&url, &state.settings) {
+                match ResolvedAddon::resolve(&url, &state.settings) {
                     Ok(addon) => {
                         let id = next_download_id;
                         next_download_id += 1;
                         downloading.insert(id, url.clone());
-                        spawn_download(&client, self.sender.clone(), id, addon, "install", url);
+                        let sender = self.sender.clone();
+                        spawn_download(&client, sender, id, addon, Fetch::Install, url);
                     }
                     // Listed and skipped until a key is saved, which fetches its manifest.
                     Err(_) if state.addons.iter().any(|addon| addon.url == url) => {}
@@ -482,11 +530,18 @@ impl App {
                 }
             }
             for url in to_refresh {
-                if let Ok(addon) = AddonBase::resolve(&url, &state.settings) {
+                if downloading
+                    .values()
+                    .any(|downloading_url| *downloading_url == url)
+                {
+                    continue;
+                }
+                if let Ok(addon) = ResolvedAddon::resolve(&url, &state.settings) {
                     let id = next_download_id;
                     next_download_id += 1;
                     downloading.insert(id, url.clone());
-                    spawn_download(&client, self.sender.clone(), id, addon, "refresh", url);
+                    let sender = self.sender.clone();
+                    spawn_download(&client, sender, id, addon, Fetch::Refresh, url);
                 }
             }
             if !hold_back {
@@ -517,20 +572,58 @@ impl App {
                         let _ = jobs.send(StoreJob::Upsert { url, manifest_json });
                     }
                 }
-                Message::Command(Command::SetRealDebridKey(key)) => {
-                    let _ = jobs.send(StoreJob::SaveRealDebridKey(settings::clean(key)));
-                }
-                Message::Command(Command::SetPlaybackLanguages { audio, subtitle }) => {
-                    let _ = jobs.send(StoreJob::SaveLanguages {
-                        audio: settings::clean(audio),
-                        subtitle: settings::clean(subtitle),
-                    });
+                Message::Command(command) => {
+                    if let Some(job) = save_settings_job(command) {
+                        let _ = jobs.send(job);
+                    }
                 }
                 _ => {}
             }
         }
         drop(jobs);
         let _ = worker.await;
+    }
+}
+
+/// The disk job that saves a settings command, with blank values made `None`. `None` for any
+/// other command.
+fn save_settings_job(command: Command) -> Option<StoreJob> {
+    match command {
+        Command::SetRealDebridKey(key) => {
+            Some(StoreJob::SaveRealDebridKey(settings::non_blank(key)))
+        }
+        Command::SetPlaybackLanguages { audio, subtitle } => Some(StoreJob::SaveLanguages {
+            audio: settings::non_blank(audio),
+            subtitle: settings::non_blank(subtitle),
+        }),
+        _ => None,
+    }
+}
+
+/// Sets each **addon**'s `skipped_reason`: whether its URL needs a key that is not saved.
+fn mark_skipped(addons: &mut [InstalledAddon], settings: &Settings) {
+    for addon in addons {
+        addon.skipped_reason = ResolvedAddon::resolve(&addon.url, settings)
+            .err()
+            .map(|missing| missing.to_string());
+    }
+}
+
+/// Why a manifest is downloaded, for the notice when it fails.
+#[derive(Clone, Copy)]
+enum Fetch {
+    Install,
+    /// An installed **addon**, after the Real-Debrid key changed or when its manifest was
+    /// never fetched.
+    Refresh,
+}
+
+impl Fetch {
+    fn verb(self) -> &'static str {
+        match self {
+            Fetch::Install => "install",
+            Fetch::Refresh => "refresh",
+        }
     }
 }
 
@@ -546,8 +639,8 @@ fn spawn_download(
     client: &reqwest::Client,
     sender: mpsc::UnboundedSender<Message>,
     id: u64,
-    addon: AddonBase,
-    verb: &'static str,
+    addon: ResolvedAddon,
+    fetch: Fetch,
     url: String,
 ) {
     let client = client.clone();
@@ -555,7 +648,7 @@ fn spawn_download(
         let result = fetch_manifest(&client, &addon)
             .await
             .map(|(_manifest, text)| text)
-            .map_err(|error| format!("Could not {verb} {url}: {error}"));
+            .map_err(|error| format!("Could not {} {url}: {error}", fetch.verb()));
         let _ = sender.send(Message::Fetched(id, result));
     });
 }
@@ -574,7 +667,7 @@ fn start_rows(
 ) -> Vec<CatalogRow> {
     let mut rows = Vec::with_capacity(catalogs.len());
     for source in catalogs {
-        let Ok(addon) = AddonBase::resolve(&source.addon_url, settings) else {
+        let Ok(addon) = ResolvedAddon::resolve(&source.addon_url, settings) else {
             continue;
         };
         let row = rows.len();
@@ -625,7 +718,7 @@ fn start_meta(
     let Some(addon) = manifests
         .iter()
         .filter(|(_, manifest)| manifest.offers("meta", meta_type, meta_id))
-        .find_map(|(addon_url, _)| AddonBase::resolve(addon_url, settings).ok())
+        .find_map(|(addon_url, _)| ResolvedAddon::resolve(addon_url, settings).ok())
     else {
         return Load::Failed(format!(
             "No installed addon can describe {meta_type} {meta_id}."
@@ -663,7 +756,7 @@ fn start_streams(
         if !manifest.offers("stream", meta_type, &video_id) {
             continue;
         }
-        let Ok(addon) = AddonBase::resolve(addon_url, settings) else {
+        let Ok(addon) = ResolvedAddon::resolve(addon_url, settings) else {
             continue;
         };
         sources.push(addon_url.clone());
@@ -708,7 +801,7 @@ fn start_subtitles(
         if !manifest.offers("subtitles", &playback.meta_type, &playback.video_id) {
             continue;
         }
-        let Ok(addon) = AddonBase::resolve(addon_url, settings) else {
+        let Ok(addon) = ResolvedAddon::resolve(addon_url, settings) else {
             continue;
         };
         let client = client.clone();
@@ -808,14 +901,16 @@ async fn store_worker(
 fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
     let mut first_launch = false;
     let mut addons_changed = true;
-    let mut key_changed = false;
+    let mut settings = None;
     match job {
-        StoreJob::Load => first_launch = store.has_no_addon_rows()?,
+        StoreJob::Load => {
+            first_launch = store.has_no_addon_rows()?;
+            settings = Some(store.load_settings()?);
+        }
         StoreJob::Upsert { url, manifest_json } => store.upsert_addon(&url, &manifest_json)?,
         StoreJob::Remove { url } => store.remove_addon(&url)?,
         StoreJob::SaveRealDebridKey(key) => {
             addons_changed = false;
-            key_changed = store.load_settings()?.key() != key.as_deref();
             store.save_real_debrid_key(key.as_deref())?;
         }
         StoreJob::SaveLanguages { audio, subtitle } => {
@@ -823,13 +918,12 @@ fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
             store.save_languages(audio.as_deref(), subtitle.as_deref())?;
         }
     }
-    let settings = store.load_settings()?;
     let mut addons = Vec::new();
     let mut catalogs = Vec::new();
     let mut search_catalogs = Vec::new();
     let mut manifests = Vec::new();
     for stored in store.list_addons()? {
-        let Some((addon, manifest)) = installed_addon(stored, &settings) else {
+        let Some((addon, manifest)) = installed_addon(stored) else {
             continue;
         };
         let Some(manifest) = manifest else {
@@ -856,7 +950,6 @@ fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
         addons,
         settings,
         addons_changed,
-        key_changed,
         catalogs,
         search_catalogs,
         manifests,
@@ -866,13 +959,7 @@ fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
 
 /// Returns the **addon** with its manifest, or with none when the manifest was never fetched.
 /// A saved row whose manifest can no longer be read is left out of the list.
-fn installed_addon(
-    stored: StoredAddon,
-    settings: &Settings,
-) -> Option<(InstalledAddon, Option<Manifest>)> {
-    let skipped_reason = AddonBase::resolve(&stored.url, settings)
-        .err()
-        .map(|missing| missing.to_string());
+fn installed_addon(stored: StoredAddon) -> Option<(InstalledAddon, Option<Manifest>)> {
     if stored.manifest_json.is_empty() {
         let name = reqwest::Url::parse(&stored.url)
             .ok()
@@ -884,7 +971,7 @@ fn installed_addon(
             name,
             version: String::new(),
             description: String::new(),
-            skipped_reason,
+            skipped_reason: None,
         };
         return Some((addon, None));
     }
@@ -895,7 +982,7 @@ fn installed_addon(
         name: manifest.name.clone(),
         version: manifest.version.clone(),
         description: manifest.description.clone().unwrap_or_default(),
-        skipped_reason,
+        skipped_reason: None,
     };
     Some((addon, Some(manifest)))
 }

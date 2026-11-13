@@ -4,31 +4,50 @@
 use eframe::egui;
 use streem_core::{Command, Core, State};
 
-/// The languages offered: ISO 639-2 code as saved, other codes a file may tag the same
-/// language with, and the name shown.
-const LANGUAGES: &[(&str, &str, &str)] = &[
-    ("eng", "en", "English"),
-    ("fre", "fra,fr", "French"),
-    ("ger", "deu,de", "German"),
-    ("spa", "es", "Spanish"),
-    ("ita", "it", "Italian"),
-    ("por", "pt", "Portuguese"),
-    ("dut", "nld,nl", "Dutch"),
-    ("pol", "pl", "Polish"),
-    ("rus", "ru", "Russian"),
-    ("tur", "tr", "Turkish"),
-    ("ara", "ar", "Arabic"),
-    ("hin", "hi", "Hindi"),
-    ("jpn", "ja", "Japanese"),
-    ("kor", "ko", "Korean"),
-    ("chi", "zho,zh", "Chinese"),
+/// A language offered in the dropdowns.
+struct Language {
+    /// The ISO 639-2 code that is saved.
+    code: &'static str,
+    /// Other codes a file may tag the same language with, comma-separated as mpv takes them.
+    other_codes: &'static str,
+    name: &'static str,
+}
+
+const fn language(code: &'static str, other_codes: &'static str, name: &'static str) -> Language {
+    Language {
+        code,
+        other_codes,
+        name,
+    }
+}
+
+const LANGUAGES: &[Language] = &[
+    language("eng", "en", "English"),
+    language("fre", "fra,fr", "French"),
+    language("ger", "deu,de", "German"),
+    language("spa", "es", "Spanish"),
+    language("ita", "it", "Italian"),
+    language("por", "pt", "Portuguese"),
+    language("dut", "nld,nl", "Dutch"),
+    language("pol", "pl", "Polish"),
+    language("rus", "ru", "Russian"),
+    language("tur", "tr", "Turkish"),
+    language("ara", "ar", "Arabic"),
+    language("hin", "hi", "Hindi"),
+    language("jpn", "ja", "Japanese"),
+    language("kor", "ko", "Korean"),
+    language("chi", "zho,zh", "Chinese"),
 ];
+
+fn find_language(code: &str) -> Option<&'static Language> {
+    LANGUAGES.iter().find(|language| language.code == code)
+}
 
 /// What mpv's `alang` and `slang` take for a saved code: the code and the other codes of the
 /// same language, so a track tagged `en` matches `eng`.
 pub fn mpv_languages(code: &str) -> String {
-    match LANGUAGES.iter().find(|(saved, _, _)| *saved == code) {
-        Some((code, others, _)) => format!("{code},{others}"),
+    match find_language(code) {
+        Some(language) => format!("{},{}", language.code, language.other_codes),
         None => code.to_string(),
     }
 }
@@ -36,10 +55,7 @@ pub fn mpv_languages(code: &str) -> String {
 fn language_name(code: Option<&str>) -> &str {
     match code {
         None => "None",
-        Some(code) => LANGUAGES
-            .iter()
-            .find(|(saved, _, _)| *saved == code)
-            .map_or(code, |(_, _, name)| name),
+        Some(code) => find_language(code).map_or(code, |language| language.name),
     }
 }
 
@@ -131,8 +147,8 @@ fn language_menu(ui: &mut egui::Ui, id_salt: &str, selected: &mut Option<String>
         .width(180.0)
         .show_ui(ui, |ui| {
             ui.selectable_value(selected, None, "None");
-            for (code, _, name) in LANGUAGES {
-                ui.selectable_value(selected, Some(code.to_string()), *name);
+            for language in LANGUAGES {
+                ui.selectable_value(selected, Some(language.code.to_string()), language.name);
             }
         });
 }

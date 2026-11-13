@@ -1,7 +1,7 @@
 //! Talking to an **addon** over HTTP: its manifest, catalogs, metas, streams and subtitles.
 //!
-//! Every request starts from an [`AddonBase`], and the only way to make one is
-//! [`AddonBase::resolve`], which fills the `{real_debrid_key}` placeholder. The URLs of the
+//! Every request starts from an [`ResolvedAddon`], and the only way to make one is
+//! [`ResolvedAddon::resolve`], which fills the `{real_debrid_key}` placeholder. The URLs of the
 //! requests are built here and nowhere else. They can hold a **debrid service** key, so no
 //! error from this module contains a URL it requested.
 
@@ -79,15 +79,15 @@ pub fn http_client() -> reqwest::Client {
 /// Where the requests to one **addon** go: its stored URL with the Real-Debrid key filled in.
 /// It holds the key, so it has no `Debug` and is never stored, logged or shown.
 #[derive(Clone)]
-pub struct AddonBase {
+pub struct ResolvedAddon {
     manifest_url: String,
 }
 
-impl AddonBase {
+impl ResolvedAddon {
     /// Fills the placeholder in the stored **addon** URL with [`url::resolve`]. Fails when the
     /// URL has a placeholder and no key is saved; the **addon** is then skipped.
-    pub fn resolve(template: &str, settings: &Settings) -> Result<AddonBase, MissingKey> {
-        Ok(AddonBase {
+    pub fn resolve(template: &str, settings: &Settings) -> Result<ResolvedAddon, MissingKey> {
+        Ok(ResolvedAddon {
             manifest_url: url::resolve(template, settings)?,
         })
     }
@@ -106,7 +106,7 @@ async fn get(client: &reqwest::Client, url: &str) -> Result<String, AddonError> 
 /// Downloads and checks a manifest. Returns it with the raw text, which is what gets stored.
 pub async fn fetch_manifest(
     client: &reqwest::Client,
-    addon: &AddonBase,
+    addon: &ResolvedAddon,
 ) -> Result<(Manifest, String), AddonError> {
     let text = get(client, &addon.manifest_url).await?;
     let manifest = parse_manifest(&text)?;
@@ -182,7 +182,7 @@ fn search_url(
 /// entry that lacks an id, type or name is skipped, so one bad entry does not hide the rest.
 pub async fn fetch_catalog(
     client: &reqwest::Client,
-    addon: &AddonBase,
+    addon: &ResolvedAddon,
     meta_type: &str,
     catalog_id: &str,
     query: Option<&str>,
@@ -221,7 +221,7 @@ fn stream_url(manifest_url: &str, meta_type: &str, video_id: &str) -> Result<Str
 /// skipped, so one bad entry does not hide the rest.
 pub async fn fetch_streams(
     client: &reqwest::Client,
-    addon: &AddonBase,
+    addon: &ResolvedAddon,
     meta_type: &str,
     video_id: &str,
 ) -> Result<Vec<Stream>, AddonError> {
@@ -256,7 +256,7 @@ fn subtitles_url(
 /// skipped, so one bad entry does not hide the rest.
 pub async fn fetch_subtitles(
     client: &reqwest::Client,
-    addon: &AddonBase,
+    addon: &ResolvedAddon,
     meta_type: &str,
     video_id: &str,
 ) -> Result<Vec<Subtitle>, AddonError> {
@@ -281,7 +281,7 @@ pub async fn fetch_subtitles(
 /// whose id is the meta id, so there is always something to play.
 pub async fn fetch_meta(
     client: &reqwest::Client,
-    addon: &AddonBase,
+    addon: &ResolvedAddon,
     meta_type: &str,
     meta_id: &str,
 ) -> Result<Meta, AddonError> {
@@ -353,7 +353,7 @@ mod tests {
             ..Settings::default()
         };
         let template = "https://example.com/realdebrid={real_debrid_key}/manifest.json";
-        let addon = AddonBase::resolve(template, &settings).unwrap();
+        let addon = ResolvedAddon::resolve(template, &settings).unwrap();
         assert_eq!(
             stream_url(&addon.manifest_url, "movie", "tt1").unwrap(),
             "https://example.com/realdebrid=ab%2Fc/stream/movie/tt1.json"
