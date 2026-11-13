@@ -19,13 +19,14 @@ use crate::addon::types::{
     Manifest, ManifestCatalog, Meta, MetaPreview, Stream, StreamSource, is_http,
 };
 use crate::addon::url::{has_placeholder, templatize};
+use crate::library;
 use crate::playback::{self, Links, Reported};
 use crate::posters::{self, Poster, PosterCache};
 use crate::settings::{self, Settings};
 use crate::store::{Store, StoreError, StoredAddon};
 use crate::{
-    CatalogRow, Command, Details, InstalledAddon, Load, Notice, Playback, Search, State,
-    StreamGroup, StreamItem, StreamList, SubtitleTrack,
+    CatalogRow, Command, Details, InstalledAddon, LibraryItem, Load, Notice, Playback, Search,
+    State, StreamGroup, StreamItem, StreamList, SubtitleTrack,
 };
 
 /// Position-only reports from the player are published at most this often.
@@ -84,14 +85,24 @@ pub(crate) enum RowList {
     Search,
 }
 
+/// What a disk job read back after its write.
+pub(crate) enum StoreOutput {
+    /// After loading at startup, installing or removing an **addon**.
+    Addons(AddonList),
+    /// After loading at startup, adding to or removing from the library.
+    Library(Vec<LibraryItem>),
+    /// After loading at startup.
+    SettingsLoaded(Settings),
+    /// After saving a setting. `State` already shows it.
+    SettingsSaved,
+}
+
 /// The **addon** list as saved, after a disk job.
-pub(crate) struct StoreOutput {
+pub(crate) struct AddonList {
     /// `skipped_reason` is not set yet; the task sets it from its own settings.
     addons: Vec<InstalledAddon>,
-    /// The saved settings, read by the startup load only.
-    settings: Option<Settings>,
-    /// The job was a startup load, an install or a removal.
-    addons_changed: bool,
+    /// Set by the load at startup.
+    loaded_at_startup: bool,
     /// The catalogs the home screen can show, from the saved manifests.
     catalogs: Vec<CatalogSource>,
     /// The catalogs a search asks, from the saved manifests.
@@ -122,6 +133,18 @@ enum StoreJob {
     Remove {
         url: String,
     },
+    Library(LibraryJob),
+    Settings(SettingsJob),
+}
+
+enum LibraryJob {
+    Load,
+    Add(LibraryItem),
+    Remove { meta_id: String },
+}
+
+enum SettingsJob {
+    Load,
     SaveRealDebridKey(Option<String>),
     SaveLanguages {
         audio: Option<String>,
@@ -148,7 +171,10 @@ impl App {
             job_inbox,
             self.sender.clone(),
         ));
+        // Settings first, so the **addons** are listed knowing which ones need a key.
+        let _ = jobs.send(StoreJob::Settings(SettingsJob::Load));
         let _ = jobs.send(StoreJob::Load);
+        let _ = jobs.send(StoreJob::Library(LibraryJob::Load));
 
         let client = http_client();
         let mut state = State::default();
@@ -278,7 +304,9 @@ impl App {
                         meta_id,
                         meta,
                         streams: None,
+                        in_library: false,
                     });
+                    library::mark_details(&mut state);
                 }
                 Message::Command(Command::CloseTitle) => {
                     details_generation += 1;
@@ -399,29 +427,36 @@ impl App {
                     let _ = jobs.send(StoreJob::Remove { url });
                 }
                 Message::Command(Command::DismissNotice) => state.notice = None,
+                Message::Command(
+                    command @ (Command::AddToLibrary | Command::RemoveFromLibrary { .. }),
+                ) => {
+                    if let Some(job) = library_job(&state, command) {
+                        let _ = jobs.send(job);
+                    }
+                }
                 // A setting changes in `State` at once, so a command right after it, such as
                 // an install, already uses it; the save follows on the disk worker.
                 Message::Command(
                     command @ (Command::SetRealDebridKey(_) | Command::SetPlaybackLanguages { .. }),
                 ) => {
-                    let Some(job) = save_settings_job(command) else {
+                    let Some(job) = settings_job(command) else {
                         continue;
                     };
                     match &job {
-                        StoreJob::SaveRealDebridKey(key) => {
+                        SettingsJob::SaveRealDebridKey(key) => {
                             key_set = true;
                             let changed = state.settings.key() != key.as_deref();
                             state.settings.real_debrid_key = key.clone();
                             key_saved = Some(changed);
                         }
-                        StoreJob::SaveLanguages { audio, subtitle } => {
+                        SettingsJob::SaveLanguages { audio, subtitle } => {
                             languages_set = true;
                             state.settings.audio_lang = audio.clone();
                             state.settings.subtitle_lang = subtitle.clone();
                         }
-                        _ => {}
+                        SettingsJob::Load => {}
                     }
-                    let _ = jobs.send(job);
+                    let _ = jobs.send(StoreJob::Settings(job));
                 }
                 Message::Fetched(id, result) => {
                     // Not in the map: the **addon** was removed while it was downloading.
@@ -436,24 +471,30 @@ impl App {
                         }
                     }
                 }
-                Message::Stored(Ok(output)) => {
-                    if let Some(saved) = output.settings {
-                        first_load = true;
-                        // A setting changed before the startup load finished is newer.
-                        if !key_set {
-                            state.settings.real_debrid_key = saved.real_debrid_key;
-                        }
-                        if !languages_set {
-                            state.settings.audio_lang = saved.audio_lang;
-                            state.settings.subtitle_lang = saved.subtitle_lang;
-                        }
+                Message::Stored(Ok(StoreOutput::Library(items))) => {
+                    library::replace(&mut state, items);
+                }
+                Message::Stored(Ok(StoreOutput::SettingsLoaded(saved))) => {
+                    // A setting changed before the startup load finished is newer.
+                    if !key_set {
+                        state.settings.real_debrid_key = saved.real_debrid_key;
                     }
+                    if !languages_set {
+                        state.settings.audio_lang = saved.audio_lang;
+                        state.settings.subtitle_lang = saved.subtitle_lang;
+                    }
+                    mark_skipped(&mut state.addons, &state.settings);
+                }
+                Message::Stored(Ok(StoreOutput::SettingsSaved)) => {}
+                Message::Stored(Ok(StoreOutput::Addons(output))) => {
                     state.addons = output.addons;
                     mark_skipped(&mut state.addons, &state.settings);
+                    first_load = output.loaded_at_startup;
+                    // Every **addon** job is a startup load, an install or a removal.
                     catalogs = output.catalogs;
                     search_catalogs = output.search_catalogs;
                     manifests = output.manifests;
-                    reload_home = output.addons_changed;
+                    reload_home = true;
                     if output.first_launch {
                         to_install.extend(self.default_addon_urls.iter().cloned());
                     }
@@ -558,11 +599,18 @@ impl App {
             }
         }
 
-        // Shutting down. Keep what the person already asked for: removals and downloaded
-        // manifests still waiting in the inbox become disk jobs, then wait for the disk
-        // worker to finish every queued job. Downloads still in progress are given up.
+        // Shutting down. Keep what the person already asked for: removals, library changes and
+        // downloaded manifests still waiting in the inbox become disk jobs, then wait for the
+        // disk worker to finish every queued job. Downloads still in progress are given up.
         while let Ok(message) = self.inbox.try_recv() {
             match message {
+                Message::Command(
+                    command @ (Command::AddToLibrary | Command::RemoveFromLibrary { .. }),
+                ) => {
+                    if let Some(job) = library_job(&state, command) {
+                        let _ = jobs.send(job);
+                    }
+                }
                 Message::Command(Command::RemoveAddon { url }) => {
                     downloading.retain(|_, downloading_url| *downloading_url != url);
                     let _ = jobs.send(StoreJob::Remove { url });
@@ -573,8 +621,8 @@ impl App {
                     }
                 }
                 Message::Command(command) => {
-                    if let Some(job) = save_settings_job(command) {
-                        let _ = jobs.send(job);
+                    if let Some(job) = settings_job(command) {
+                        let _ = jobs.send(StoreJob::Settings(job));
                     }
                 }
                 _ => {}
@@ -585,14 +633,25 @@ impl App {
     }
 }
 
+/// The disk job for a library command, or `None` when it is ignored: adding with no ready
+/// details. Shared by the main loop and the shutdown drain, so both ignore the same commands.
+fn library_job(state: &State, command: Command) -> Option<StoreJob> {
+    let job = match command {
+        Command::AddToLibrary => LibraryJob::Add(library::item_to_add(state)?),
+        Command::RemoveFromLibrary { meta_id } => LibraryJob::Remove { meta_id },
+        _ => return None,
+    };
+    Some(StoreJob::Library(job))
+}
+
 /// The disk job that saves a settings command, with blank values made `None`. `None` for any
-/// other command.
-fn save_settings_job(command: Command) -> Option<StoreJob> {
+/// other command. Shared by the main loop and the shutdown drain.
+fn settings_job(command: Command) -> Option<SettingsJob> {
     match command {
         Command::SetRealDebridKey(key) => {
-            Some(StoreJob::SaveRealDebridKey(settings::non_blank(key)))
+            Some(SettingsJob::SaveRealDebridKey(settings::non_blank(key)))
         }
-        Command::SetPlaybackLanguages { audio, subtitle } => Some(StoreJob::SaveLanguages {
+        Command::SetPlaybackLanguages { audio, subtitle } => Some(SettingsJob::SaveLanguages {
             audio: settings::non_blank(audio),
             subtitle: settings::non_blank(subtitle),
         }),
@@ -898,25 +957,40 @@ async fn store_worker(
     }
 }
 
+/// Writes the library change, if any, then reads the whole library back.
+fn run_library_job(store: &Store, job: LibraryJob) -> Result<StoreOutput, StoreError> {
+    match job {
+        LibraryJob::Load => {}
+        LibraryJob::Add(item) => store.add_to_library(&item)?,
+        LibraryJob::Remove { meta_id } => store.remove_from_library(&meta_id)?,
+    }
+    Ok(StoreOutput::Library(store.list_library()?))
+}
+
+/// Loads the settings, or saves one change to them.
+fn run_settings_job(store: &Store, job: SettingsJob) -> Result<StoreOutput, StoreError> {
+    match job {
+        SettingsJob::Load => return Ok(StoreOutput::SettingsLoaded(store.load_settings()?)),
+        SettingsJob::SaveRealDebridKey(key) => store.save_real_debrid_key(key.as_deref())?,
+        SettingsJob::SaveLanguages { audio, subtitle } => {
+            store.save_languages(audio.as_deref(), subtitle.as_deref())?;
+        }
+    }
+    Ok(StoreOutput::SettingsSaved)
+}
+
 fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
     let mut first_launch = false;
-    let mut addons_changed = true;
-    let mut settings = None;
+    let mut loaded_at_startup = false;
     match job {
         StoreJob::Load => {
             first_launch = store.has_no_addon_rows()?;
-            settings = Some(store.load_settings()?);
+            loaded_at_startup = true;
         }
         StoreJob::Upsert { url, manifest_json } => store.upsert_addon(&url, &manifest_json)?,
         StoreJob::Remove { url } => store.remove_addon(&url)?,
-        StoreJob::SaveRealDebridKey(key) => {
-            addons_changed = false;
-            store.save_real_debrid_key(key.as_deref())?;
-        }
-        StoreJob::SaveLanguages { audio, subtitle } => {
-            addons_changed = false;
-            store.save_languages(audio.as_deref(), subtitle.as_deref())?;
-        }
+        StoreJob::Library(job) => return run_library_job(store, job),
+        StoreJob::Settings(job) => return run_settings_job(store, job),
     }
     let mut addons = Vec::new();
     let mut catalogs = Vec::new();
@@ -946,15 +1020,14 @@ fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
         manifests.push((addon.url.clone(), manifest));
         addons.push(addon);
     }
-    Ok(StoreOutput {
+    Ok(StoreOutput::Addons(AddonList {
         addons,
-        settings,
-        addons_changed,
+        loaded_at_startup,
         catalogs,
         search_catalogs,
         manifests,
         first_launch,
-    })
+    }))
 }
 
 /// Returns the **addon** with its manifest, or with none when the manifest was never fetched.

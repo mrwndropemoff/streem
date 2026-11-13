@@ -10,8 +10,12 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::settings::Settings;
 
+use crate::LibraryItem;
+
 /// Until sign-in exists, every row belongs to this **account**.
 pub const LOCAL_ACCOUNT: &str = "local";
+/// Until **profiles** exist, every library row belongs to this **profile**.
+pub const LOCAL_PROFILE: &str = "local";
 
 /// Applied in order. The schema version is the number of entries already applied
 /// (`PRAGMA user_version`). Append new migrations at the end; never edit an old one.
@@ -27,7 +31,20 @@ const MIGRATIONS: &[&str] = &[
         dirty         INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (account_id, url)
     )",
-    // 2: the **account**'s settings, one row per **account**. `dirty` and `updated_at` are
+    // 2: the library. `deleted`, `dirty` and `updated_at` are used by sync.
+    "CREATE TABLE library_items (
+        account_id TEXT    NOT NULL,
+        profile_id TEXT    NOT NULL,
+        meta_id    TEXT    NOT NULL,
+        meta_type  TEXT    NOT NULL,
+        name       TEXT    NOT NULL,
+        poster     TEXT,
+        updated_at INTEGER NOT NULL,
+        deleted    INTEGER NOT NULL DEFAULT 0,
+        dirty      INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (profile_id, meta_id)
+    )",
+    // 3: the **account**'s settings, one row per **account**. `dirty` and `updated_at` are
     // used by sync.
     "CREATE TABLE account_settings (
         account_id      TEXT PRIMARY KEY,
@@ -186,6 +203,76 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// The titles in the library (not removed ones), most recently added first.
+    pub fn list_library(&self) -> Result<Vec<LibraryItem>, StoreError> {
+        let connection = self.lock();
+        let mut statement = connection.prepare(
+            "SELECT meta_type, meta_id, name, poster FROM library_items
+             WHERE profile_id = ?1 AND deleted = 0 ORDER BY updated_at DESC, meta_id",
+        )?;
+        let rows = statement.query_map(params![LOCAL_PROFILE], |row| {
+            Ok(LibraryItem {
+                meta_type: row.get(0)?,
+                meta_id: row.get(1)?,
+                name: row.get(2)?,
+                poster: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Saves a title to the library, at the front. Adding a removed title brings its row back.
+    pub fn add_to_library(&self, item: &LibraryItem) -> Result<(), StoreError> {
+        let connection = self.lock();
+        let updated_at = next_library_time(&connection)?;
+        connection.execute(
+            "INSERT INTO library_items
+                 (account_id, profile_id, meta_id, meta_type, name, poster,
+                  updated_at, deleted, dirty)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 1)
+             ON CONFLICT (profile_id, meta_id) DO UPDATE SET
+                 meta_type = excluded.meta_type,
+                 name = excluded.name,
+                 poster = excluded.poster,
+                 updated_at = excluded.updated_at,
+                 deleted = 0,
+                 dirty = 1",
+            params![
+                LOCAL_ACCOUNT,
+                LOCAL_PROFILE,
+                item.meta_id,
+                item.meta_type,
+                item.name,
+                item.poster,
+                updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Marks a title as removed from the library. The row stays so sync can tell other devices.
+    pub fn remove_from_library(&self, meta_id: &str) -> Result<(), StoreError> {
+        let connection = self.lock();
+        let updated_at = next_library_time(&connection)?;
+        connection.execute(
+            "UPDATE library_items SET deleted = 1, dirty = 1, updated_at = ?3
+             WHERE profile_id = ?1 AND meta_id = ?2 AND deleted = 0",
+            params![LOCAL_PROFILE, meta_id, updated_at],
+        )?;
+        Ok(())
+    }
+}
+
+/// The `updated_at` for a library write: now, but always later than every earlier write, so
+/// two titles added within the same millisecond still list in the order they were added.
+fn next_library_time(connection: &Connection) -> Result<i64, StoreError> {
+    let latest: Option<i64> = connection.query_row(
+        "SELECT MAX(updated_at) FROM library_items WHERE profile_id = ?1",
+        params![LOCAL_PROFILE],
+        |row| row.get(0),
+    )?;
+    Ok(latest.map_or(now_millis(), |latest| now_millis().max(latest + 1)))
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
@@ -295,6 +382,28 @@ mod tests {
     }
 
     #[test]
+    fn a_database_from_the_library_build_gets_the_settings_table() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            // What the build before account settings left: migrations 1 and 2.
+            let mut connection = Connection::open(dir.path().join("streem.db")).unwrap();
+            let transaction = connection.transaction().unwrap();
+            for sql in &MIGRATIONS[..2] {
+                transaction.execute_batch(sql).unwrap();
+            }
+            transaction.pragma_update(None, "user_version", 2).unwrap();
+            transaction.commit().unwrap();
+        }
+
+        let store = Store::open(dir.path()).unwrap();
+        store.save_real_debrid_key(Some("KEY")).unwrap();
+        assert_eq!(
+            store.load_settings().unwrap().real_debrid_key.as_deref(),
+            Some("KEY")
+        );
+    }
+
+    #[test]
     fn settings_start_unset_and_each_save_keeps_the_other_columns() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
@@ -319,5 +428,86 @@ mod tests {
 
         reopened.save_real_debrid_key(None).unwrap();
         assert_eq!(reopened.load_settings().unwrap().real_debrid_key, None);
+    }
+
+    fn film(meta_id: &str) -> LibraryItem {
+        LibraryItem {
+            meta_type: "movie".into(),
+            meta_id: meta_id.into(),
+            name: format!("Film {meta_id}"),
+            poster: None,
+        }
+    }
+
+    /// `(account_id, profile_id, deleted, dirty, updated_at)` of a library row.
+    fn library_row(store: &Store, meta_id: &str) -> (String, String, i64, i64, i64) {
+        store
+            .lock()
+            .query_row(
+                "SELECT account_id, profile_id, deleted, dirty, updated_at
+                 FROM library_items WHERE meta_id = ?1",
+                [meta_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn adding_to_the_library_saves_a_dirty_local_row() {
+        let (_dir, store) = open();
+        store.add_to_library(&film("tt1")).unwrap();
+
+        let (account, profile, deleted, dirty, updated_at) = library_row(&store, "tt1");
+        assert_eq!((account.as_str(), profile.as_str()), ("local", "local"));
+        assert_eq!((deleted, dirty), (0, 1));
+        assert!(
+            updated_at > 1_600_000_000_000,
+            "{updated_at} is not in milliseconds"
+        );
+    }
+
+    #[test]
+    fn removing_from_the_library_keeps_the_row_and_marks_it() {
+        let (_dir, store) = open();
+        store.add_to_library(&film("tt1")).unwrap();
+        let (.., added_at) = library_row(&store, "tt1");
+        store
+            .lock()
+            .execute("UPDATE library_items SET dirty = 0", [])
+            .unwrap();
+
+        store.remove_from_library("tt1").unwrap();
+
+        assert!(store.list_library().unwrap().is_empty());
+        let (_, _, deleted, dirty, removed_at) = library_row(&store, "tt1");
+        assert_eq!((deleted, dirty), (1, 1));
+        assert!(removed_at > added_at);
+    }
+
+    #[test]
+    fn adding_a_removed_title_again_brings_its_row_back_at_the_front() {
+        let (_dir, store) = open();
+        store.add_to_library(&film("tt1")).unwrap();
+        store.add_to_library(&film("tt2")).unwrap();
+        store.remove_from_library("tt1").unwrap();
+        store.add_to_library(&film("tt1")).unwrap();
+
+        let ids: Vec<_> = store
+            .list_library()
+            .unwrap()
+            .into_iter()
+            .map(|item| item.meta_id)
+            .collect();
+        assert_eq!(ids, ["tt1", "tt2"]);
+        let (_, _, deleted, dirty, _) = library_row(&store, "tt1");
+        assert_eq!((deleted, dirty), (0, 1));
     }
 }

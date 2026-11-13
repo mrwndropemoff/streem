@@ -2072,6 +2072,261 @@ async fn an_addon_without_subtitles_for_this_id_is_not_asked() {
     assert_eq!(subtitles_requests(&server).await, 0);
 }
 
+// ---- Library --------------------------------------------------------------------------------
+
+use streem_core::LibraryItem;
+
+/// A `Core` with one **addon** that describes `tt1` ("A Film") and `tt2` ("Another Film").
+async fn core_with_films(server: &MockServer, dir: &Path) -> Core {
+    let url = serve_meta_addon(server, "one", r#""meta""#).await;
+    serve_json(
+        server,
+        "/one/meta/movie/tt1.json",
+        200,
+        r#"{"meta": {"id": "tt1", "type": "movie", "name": "A Film", "poster": "http://x/1.jpg"}}"#,
+    )
+    .await;
+    serve_json(
+        server,
+        "/one/meta/movie/tt2.json",
+        200,
+        r#"{"meta": {"id": "tt2", "type": "movie", "name": "Another Film"}}"#,
+    )
+    .await;
+    let core = start(dir);
+    install(&core, url, 1).await;
+    core
+}
+
+/// Opens a film and waits for its own details, not those of the title open before it.
+async fn open_film(core: &Core, meta_id: &str) -> std::sync::Arc<State> {
+    core.send(Command::OpenTitle {
+        meta_type: "movie".into(),
+        meta_id: meta_id.into(),
+    });
+    wait_for(core, "film details ready", |s| {
+        s.details
+            .as_ref()
+            .is_some_and(|d| d.meta_id == meta_id && matches!(d.meta, Load::Ready(_)))
+    })
+    .await
+}
+
+fn in_library(state: &State) -> bool {
+    state.details.as_ref().is_some_and(|d| d.in_library)
+}
+
+fn library_ids(state: &State) -> Vec<&str> {
+    state
+        .library
+        .iter()
+        .map(|item| item.meta_id.as_str())
+        .collect()
+}
+
+#[tokio::test]
+async fn adding_a_ready_title_puts_it_in_the_library() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_with_films(&server, dir.path()).await;
+    open_film(&core, "tt1").await;
+    assert!(!in_library(&core.state()));
+
+    core.send(Command::AddToLibrary);
+    let state = wait_for(&core, "title in library", |s| !s.library.is_empty()).await;
+
+    assert_eq!(
+        state.library,
+        [LibraryItem {
+            meta_type: "movie".into(),
+            meta_id: "tt1".into(),
+            name: "A Film".into(),
+            poster: Some("http://x/1.jpg".into()),
+        }]
+    );
+    assert!(in_library(&state));
+}
+
+#[tokio::test]
+async fn adding_to_the_library_with_no_details_changes_nothing() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_with_films(&server, dir.path()).await;
+
+    core.send(Command::AddToLibrary);
+    // Commands are handled in order, so once this one's notice shows, the add was handled.
+    core.send(Command::InstallAddon {
+        url: "hello".into(),
+    });
+    let state = wait_for(&core, "a notice", |s| s.notice.is_some()).await;
+
+    assert!(state.library.is_empty());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(core.state().library.is_empty());
+}
+
+#[tokio::test]
+async fn adding_to_the_library_while_the_details_failed_changes_nothing() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_with_films(&server, dir.path()).await;
+    // Not served, so the **addon** answers 404.
+    core.send(Command::OpenTitle {
+        meta_type: "movie".into(),
+        meta_id: "tt9".into(),
+    });
+    wait_for(&core, "details failed", |s| {
+        s.details
+            .as_ref()
+            .is_some_and(|d| d.meta_id == "tt9" && matches!(d.meta, Load::Failed(_)))
+    })
+    .await;
+
+    core.send(Command::AddToLibrary);
+    core.send(Command::InstallAddon {
+        url: "hello".into(),
+    });
+    let state = wait_for(&core, "a notice", |s| s.notice.is_some()).await;
+
+    assert!(state.library.is_empty());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(core.state().library.is_empty());
+}
+
+#[tokio::test]
+async fn removing_from_the_library_takes_the_title_out() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_with_films(&server, dir.path()).await;
+    open_film(&core, "tt1").await;
+    core.send(Command::AddToLibrary);
+    wait_for(&core, "title in library", in_library).await;
+
+    core.send(Command::RemoveFromLibrary {
+        meta_id: "tt1".into(),
+    });
+    let state = wait_for(&core, "library empty", |s| s.library.is_empty()).await;
+
+    assert!(!in_library(&state));
+}
+
+#[tokio::test]
+async fn adding_removing_and_adding_again_leaves_one_item_in_the_library() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_with_films(&server, dir.path()).await;
+    open_film(&core, "tt1").await;
+
+    core.send(Command::AddToLibrary);
+    core.send(Command::RemoveFromLibrary {
+        meta_id: "tt1".into(),
+    });
+    core.send(Command::AddToLibrary);
+    // Disk jobs run in order, so the last answer is the last write. Give the earlier answers
+    // time to come and go.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let state = wait_for(&core, "title in library", in_library).await;
+
+    assert_eq!(library_ids(&state), ["tt1"]);
+}
+
+#[tokio::test]
+async fn the_library_lists_the_most_recently_added_title_first() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_with_films(&server, dir.path()).await;
+    open_film(&core, "tt1").await;
+    core.send(Command::AddToLibrary);
+    wait_for(&core, "first added", |s| s.library.len() == 1).await;
+
+    open_film(&core, "tt2").await;
+    core.send(Command::AddToLibrary);
+    let state = wait_for(&core, "second added", |s| s.library.len() == 2).await;
+
+    assert_eq!(library_ids(&state), ["tt2", "tt1"]);
+}
+
+#[tokio::test]
+async fn the_library_survives_a_restart() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let core = core_with_films(&server, dir.path()).await;
+        open_film(&core, "tt1").await;
+        core.send(Command::AddToLibrary);
+        wait_for(&core, "title in library", in_library).await;
+    }
+
+    let core = start(dir.path());
+    let state = wait_for(&core, "library loaded", |s| !s.library.is_empty()).await;
+
+    assert_eq!(library_ids(&state), ["tt1"]);
+    assert_eq!(state.library[0].name, "A Film");
+}
+
+#[tokio::test]
+async fn a_library_change_sent_just_before_dropping_core_is_still_saved() {
+    // Timing decides whether a lost write shows up, so try several times.
+    for _round in 0..10 {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let core = core_with_films(&server, dir.path()).await;
+            open_film(&core, "tt1").await;
+            core.send(Command::AddToLibrary);
+        } // dropped straight after sending
+
+        let core = start(dir.path());
+        wait_for(&core, "library loaded", |s| !s.library.is_empty()).await;
+    }
+}
+
+#[tokio::test]
+async fn opening_a_title_already_in_the_library_marks_it_in_library() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_with_films(&server, dir.path()).await;
+    open_film(&core, "tt1").await;
+    core.send(Command::AddToLibrary);
+    wait_for(&core, "title in library", in_library).await;
+    core.send(Command::CloseTitle);
+    wait_for(&core, "details gone", |s| s.details.is_none()).await;
+
+    assert!(!in_library(&*open_film(&core, "tt2").await));
+    assert!(in_library(&*open_film(&core, "tt1").await));
+}
+
+#[tokio::test]
+async fn a_library_change_does_not_reload_the_home_rows() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core_with_films(&server, dir.path()).await;
+    let catalogs = serve_addon(&server, "cat", r#"[{"type": "movie", "id": "top"}]"#).await;
+    serve_json(
+        &server,
+        "/cat/catalog/movie/top.json",
+        200,
+        r#"{"metas": []}"#,
+    )
+    .await;
+    install(&core, catalogs, 2).await;
+    wait_for(&core, "row loaded", |s| rows_settled(s, 1)).await;
+    open_film(&core, "tt1").await;
+
+    core.send(Command::AddToLibrary);
+    wait_for(&core, "title in library", in_library).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let catalog_requests = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/cat/catalog/movie/top.json")
+        .count();
+    assert_eq!(catalog_requests, 1);
+}
+
 // ---- Real-Debrid key placeholder ------------------------------------------------------------
 
 use streem_core::Settings;
