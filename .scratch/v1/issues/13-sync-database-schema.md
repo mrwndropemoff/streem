@@ -82,12 +82,12 @@ Running anything against a live project, Realtime configuration, any Rust code.
 
 ## Acceptance checks
 
-- [ ] `supabase/migrations/0001_init.sql` creates the five tables with exactly the columns above.
-- [ ] `grep -c "enable row level security" supabase/migrations/0001_init.sql` prints `5`.
-- [ ] `grep -c "create policy" supabase/migrations/0001_init.sql` prints `5`.
-- [ ] `grep -ci "to anon" supabase/migrations/0001_init.sql` prints `0`.
-- [ ] The trigger is created on all five tables.
-- [ ] `bash -n supabase/check-rls.sh` reports no syntax error, and the script is executable.
+- [x] `supabase/migrations/0001_init.sql` creates the five tables with exactly the columns above.
+- [x] `grep -c "enable row level security" supabase/migrations/0001_init.sql` prints `5`.
+- [x] `grep -c "create policy" supabase/migrations/0001_init.sql` prints `5`.
+- [x] `grep -ci "to anon" supabase/migrations/0001_init.sql` prints `0`.
+- [x] The trigger is created on all five tables.
+- [x] `bash -n supabase/check-rls.sh` reports no syntax error, and the script is executable.
 - [ ] The file can be run twice without error (use `if not exists` and `create or replace` where Postgres allows; drop and recreate policies and triggers).
 
 ## Rules
@@ -98,3 +98,12 @@ Running anything against a live project, Realtime configuration, any Rust code.
 - When done, tick the boxes and add a line under `## Comments` saying what you verified and how.
 
 ## Comments
+
+- Verified 2026-11-13 by running the acceptance greps (`enable row level security` 5, `create policy` 5, `to anon` 0, plus `create trigger … streem_row_guard` 5, `create table if not exists` 5 and the `(account_id, server_updated_at)` index 5), `bash -n supabase/check-rls.sh` (no error), and `git ls-files -s` (the script is `100755`). I checked the columns against the table above by reading the file.
+- Missing: there is no Postgres here (`psql` is not installed and the Docker daemon is not running), so the SQL has **not been executed**. The "run twice" box stays unticked. The file is written for it (`create … if not exists`, `create or replace function`, and `drop … if exists` before every policy and trigger), but ticket 14 is the first real run.
+- `check-rls.sh` has not been run against Supabase. Its logic was run against a fake `curl` that mimics Supabase's responses: it prints `ALL CHECKS PASSED` when the rules hold, and stops with the HTTP status and body when B can see A's rows, when the stale PATCH matches no row, when the stale PATCH overwrites the name, or when sign-up returns no token because "Confirm email" is on.
+- Small additions:
+  - Each table gets `revoke all … from anon`, because Supabase's default privileges grant every new `public` table to that role. With this, "grant nothing" is true, not just hidden by row level security. Step 5 therefore accepts either `200 []` or `401`/`403`.
+  - Step 6's PATCH sends `Prefer: return=representation` and must return the row, so an update that matched nothing cannot pass.
+  - An optional `STREEM_CHECK_EMAIL_DOMAIN` (default `example.com`) is there in case the project refuses that domain at sign-up.
+  - A root `.gitattributes` keeps `*.sh` files on LF. With `core.autocrlf=true`, a Windows checkout would otherwise write CRLF and bash would fail.
