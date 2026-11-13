@@ -1,8 +1,8 @@
-//! Settings: the Real-Debrid key that **addons** are called with, and the languages the player
-//! prefers. Everything here is drawing; saving is a `Command`.
+//! Settings: the Real-Debrid key that **addons** are called with, the languages the player
+//! prefers, and signing out of the **account**. Everything here is drawing; saving is a `Command`.
 
 use eframe::egui;
-use streem_core::{Command, Core, State};
+use streem_core::{Command, Core, Session, State};
 
 /// A language offered in the dropdowns.
 struct Language {
@@ -136,6 +136,17 @@ impl SettingsScreen {
         ui.weak("With subtitles set to None, they start off.");
         if audio != state.settings.audio_lang || subtitle != state.settings.subtitle_lang {
             core.send(Command::SetPlaybackLanguages { audio, subtitle });
+        }
+        ui.add_space(16.0);
+
+        if let Session::SignedIn { email } = &state.session {
+            ui.label(egui::RichText::new("Account").strong());
+            ui.horizontal(|ui| {
+                ui.label(format!("Signed in as {email}"));
+                if ui.button("Sign out").clicked() {
+                    core.send(Command::SignOut);
+                }
+            });
         }
     }
 }
