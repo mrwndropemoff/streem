@@ -17,7 +17,9 @@ use libmpv2::Mpv;
 use libmpv2::events::Event;
 use libmpv2::mpv_end_file_reason;
 use libmpv2::render::{OpenGLInitParams, RenderContext, RenderParam, RenderParamApiType};
-use streem_core::{Command, Core, Playback, PlaybackReport, SubtitleTrack};
+use streem_core::{Command, Core, Playback, PlaybackReport, Settings, SubtitleTrack};
+
+use crate::screens::settings::mpv_languages;
 
 /// While playing, `Core` hears about the position this often.
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
@@ -227,10 +229,16 @@ impl MpvView {
     }
 
     /// Makes mpv match `playback`, and reports back to `core`. Called every frame while
-    /// something is playing.
-    pub fn sync(&mut self, ctx: &egui::Context, playback: &Playback, core: &Core) {
+    /// something is playing. A new file starts with the languages in `settings`.
+    pub fn sync(
+        &mut self,
+        ctx: &egui::Context,
+        playback: &Playback,
+        settings: &Settings,
+        core: &Core,
+    ) {
         if self.loaded.as_deref() != Some(playback.url.as_str())
-            && let Err(error) = self.load(playback)
+            && let Err(error) = self.load(playback, settings)
         {
             // mpv refused the command itself, so no event will ever say so.
             self.send_report(core, false, false, Some(format!("mpv: {error}")));
@@ -345,13 +353,33 @@ impl MpvView {
 
     /// Loads the link. Fails only when mpv refuses the command; a link it cannot open comes
     /// back later as an event. The error never holds the link.
-    fn load(&mut self, playback: &Playback) -> libmpv2::Result<()> {
+    fn load(&mut self, playback: &Playback, settings: &Settings) -> libmpv2::Result<()> {
         self.drain_events();
         self.forget_file();
         let _ = self.mpv.set_property("pause", playback.paused);
+        self.prefer_languages(settings);
         // Remembered even on failure, so it is not retried every frame.
         self.loaded = Some(playback.url.clone());
         self.mpv.command("loadfile", &[&playback.url, "replace"])
+    }
+
+    /// Sets the tracks mpv picks for the next file. Done before every load, because a track
+    /// picked by hand from a menu would otherwise carry over to the next file. With no
+    /// subtitle language, subtitles start off.
+    fn prefer_languages(&self, settings: &Settings) {
+        let audio = settings.audio_lang.as_deref().map(mpv_languages);
+        let _ = self.mpv.set_property("alang", audio.unwrap_or_default());
+        let _ = self.mpv.set_property("aid", "auto");
+        match settings.subtitle_lang.as_deref() {
+            Some(code) => {
+                let _ = self.mpv.set_property("slang", mpv_languages(code));
+                let _ = self.mpv.set_property("sid", "auto");
+            }
+            None => {
+                let _ = self.mpv.set_property("slang", "");
+                let _ = self.mpv.set_property("sid", "no");
+            }
+        }
     }
 
     fn paused(&self) -> bool {

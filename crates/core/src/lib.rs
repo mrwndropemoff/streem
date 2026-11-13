@@ -6,6 +6,7 @@ mod app;
 mod library;
 mod playback;
 mod posters;
+pub mod settings;
 mod store;
 
 use std::path::PathBuf;
@@ -16,13 +17,19 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use addon::types::{Meta, MetaPreview, Video};
 pub use posters::Poster;
+pub use settings::Settings;
 
 /// Installed on first launch.
 const CINEMETA_URL: &str = "https://v3-cinemeta.strem.io/manifest.json";
 
-/// A request from the UI.
-#[derive(Debug, Clone, PartialEq)]
+/// A request from the UI. Its `Debug` hides the Real-Debrid key and pasted **addon** URLs,
+/// which can hold the key.
+#[derive(Clone, PartialEq)]
 pub enum Command {
+    /// Installs an **addon** from its manifest URL. The URL may hold the `{real_debrid_key}`
+    /// placeholder; with no key saved, such an **addon** is listed but skipped, and its
+    /// manifest is fetched once a key is saved. A pasted URL that holds the saved key is stored
+    /// with the placeholder in its place.
     InstallAddon {
         url: String,
     },
@@ -80,6 +87,76 @@ pub enum Command {
     RemoveFromLibrary {
         meta_id: String,
     },
+    /// Saves the Real-Debrid key; `None` or a blank key clears it. A changed key clears or sets
+    /// [`InstalledAddon::skipped_reason`], fetches again the manifests of the **addons** whose
+    /// URL has the placeholder, and reloads the home screen.
+    SetRealDebridKey(Option<String>),
+    /// Saves the languages the player prefers, as ISO 639-2 codes such as `eng`.
+    SetPlaybackLanguages {
+        audio: Option<String>,
+        subtitle: Option<String>,
+    },
+}
+
+// By hand, so that no `{:?}` of a command, in a log or a failed test, can print the key.
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hidden = |set: bool| if set { "<hidden>" } else { "None" };
+        match self {
+            Command::InstallAddon { .. } => f
+                .debug_struct("InstallAddon")
+                .field("url", &format_args!("<hidden>"))
+                .finish(),
+            Command::RemoveAddon { url } => {
+                f.debug_struct("RemoveAddon").field("url", url).finish()
+            }
+            Command::DismissNotice => f.write_str("DismissNotice"),
+            Command::LoadHome => f.write_str("LoadHome"),
+            Command::Search { query } => f.debug_struct("Search").field("query", query).finish(),
+            Command::ClearSearch => f.write_str("ClearSearch"),
+            Command::OpenTitle { meta_type, meta_id } => f
+                .debug_struct("OpenTitle")
+                .field("meta_type", meta_type)
+                .field("meta_id", meta_id)
+                .finish(),
+            Command::CloseTitle => f.write_str("CloseTitle"),
+            Command::LoadStreams { video_id } => f
+                .debug_struct("LoadStreams")
+                .field("video_id", video_id)
+                .finish(),
+            Command::Play {
+                addon_id,
+                stream_index,
+            } => f
+                .debug_struct("Play")
+                .field("addon_id", addon_id)
+                .field("stream_index", stream_index)
+                .finish(),
+            Command::SetPaused(paused) => f.debug_tuple("SetPaused").field(paused).finish(),
+            Command::Seek { position_secs } => f
+                .debug_struct("Seek")
+                .field("position_secs", position_secs)
+                .finish(),
+            Command::StopPlayback => f.write_str("StopPlayback"),
+            Command::ReportPlayback(report) => {
+                f.debug_tuple("ReportPlayback").field(report).finish()
+            }
+            Command::AddToLibrary => f.write_str("AddToLibrary"),
+            Command::RemoveFromLibrary { meta_id } => f
+                .debug_struct("RemoveFromLibrary")
+                .field("meta_id", meta_id)
+                .finish(),
+            Command::SetRealDebridKey(key) => f
+                .debug_tuple("SetRealDebridKey")
+                .field(&format_args!("{}", hidden(key.is_some())))
+                .finish(),
+            Command::SetPlaybackLanguages { audio, subtitle } => f
+                .debug_struct("SetPlaybackLanguages")
+                .field("audio", audio)
+                .field("subtitle", subtitle)
+                .finish(),
+        }
+    }
 }
 
 /// Everything the UI draws. Replaced as a whole after every change.
@@ -98,6 +175,9 @@ pub struct State {
     /// The titles in the library, most recently added first. Empty until it is loaded from
     /// local storage at startup.
     pub library: Vec<LibraryItem>,
+    /// Loaded from local storage at startup, all unset until then. A settings command changes
+    /// them at once; the save follows.
+    pub settings: Settings,
 }
 
 /// A title in the library: enough to draw its poster and open its details again.
@@ -262,11 +342,17 @@ pub struct Search {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledAddon {
+    /// As stored: may hold the `{real_debrid_key}` placeholder, never the key itself.
     pub url: String,
+    /// The fields below come from the manifest. While it has not been fetched yet, `id`,
+    /// `version` and `description` are empty and `name` is the URL's host.
     pub id: String,
     pub name: String,
     pub version: String,
     pub description: String,
+    /// Why the **addon** is left out of every request, for the person using the app. Set when
+    /// its URL has the placeholder and no Real-Debrid key is saved.
+    pub skipped_reason: Option<String>,
 }
 
 /// A message for the person using the app, such as why an install failed.

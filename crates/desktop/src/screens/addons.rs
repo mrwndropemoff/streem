@@ -1,4 +1,5 @@
 //! The list of installed **addons**, with a field to install another and a button to remove one.
+//! An **addon** that is skipped for want of a Real-Debrid key says so in a warning colour.
 
 use eframe::egui;
 use streem_core::{Command, Core, State};
@@ -39,9 +40,14 @@ impl AddonsScreen {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(egui::RichText::new(&addon.name).strong());
-                        ui.weak(format!("version {}", addon.version));
+                        if !addon.version.is_empty() {
+                            ui.weak(format!("version {}", addon.version));
+                        }
                         if !addon.description.is_empty() {
                             ui.label(&addon.description);
+                        }
+                        if let Some(reason) = &addon.skipped_reason {
+                            ui.colored_label(ui.visuals().warn_fg_color, reason);
                         }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

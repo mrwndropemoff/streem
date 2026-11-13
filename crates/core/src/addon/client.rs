@@ -1,10 +1,17 @@
 //! Talking to an **addon** over HTTP: its manifest, catalogs, metas, streams and subtitles.
+//!
+//! Every request starts from an [`ResolvedAddon`], and the only way to make one is
+//! [`ResolvedAddon::resolve`], which fills the `{real_debrid_key}` placeholder. The URLs of the
+//! requests are built here and nowhere else. They can hold a **debrid service** key, so no
+//! error from this module contains a URL it requested.
 
 use std::time::Duration;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 use super::types::{Manifest, Meta, MetaPreview, Stream, Subtitle, Video};
+use super::url::{self, MissingKey};
+use crate::settings::Settings;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AddonError {
@@ -12,8 +19,10 @@ pub enum AddonError {
         "\"{0}\" is not an addon URL; it must be an http(s) or stremio:// link ending in /manifest.json"
     )]
     InvalidUrl(String),
+    #[error("the addon's URL cannot be used for a request")]
+    UnusableUrl,
     #[error("could not reach the addon: {0}")]
-    Network(#[from] reqwest::Error),
+    Network(reqwest::Error),
     #[error("the addon answered with HTTP status {0}")]
     Status(u16),
     #[error("the addon's manifest is not valid: {0}")]
@@ -28,8 +37,16 @@ pub enum AddonError {
     InvalidSubtitles(serde_json::Error),
 }
 
+impl From<reqwest::Error> for AddonError {
+    /// Drops the URL, which can hold a **debrid service** key, from the error's text.
+    fn from(error: reqwest::Error) -> Self {
+        AddonError::Network(error.without_url())
+    }
+}
+
 /// Turns what the user typed into the URL that identifies the **addon**.
-/// A `stremio://` link becomes `https://`. Nothing else in the text is changed.
+/// A `stremio://` link becomes `https://`. Nothing else in the text is changed, so a
+/// `{real_debrid_key}` placeholder stays as typed.
 pub fn normalize_url(input: &str) -> Result<String, AddonError> {
     let trimmed = input.trim();
     let url = match trimmed.get(..10) {
@@ -59,17 +76,39 @@ pub fn http_client() -> reqwest::Client {
         .expect("the HTTP client settings are valid")
 }
 
-/// Downloads and checks a manifest. Returns it with the raw text, which is what gets stored.
-pub async fn fetch_manifest(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<(Manifest, String), AddonError> {
+/// Where the requests to one **addon** go: its stored URL with the Real-Debrid key filled in.
+/// It holds the key, so it has no `Debug` and is never stored, logged or shown.
+#[derive(Clone)]
+pub struct ResolvedAddon {
+    manifest_url: String,
+}
+
+impl ResolvedAddon {
+    /// Fills the placeholder in the stored **addon** URL with [`url::resolve`]. Fails when the
+    /// URL has a placeholder and no key is saved; the **addon** is then skipped.
+    pub fn resolve(template: &str, settings: &Settings) -> Result<ResolvedAddon, MissingKey> {
+        Ok(ResolvedAddon {
+            manifest_url: url::resolve(template, settings)?,
+        })
+    }
+}
+
+/// Sends a GET request and returns the body of a successful answer.
+async fn get(client: &reqwest::Client, url: &str) -> Result<String, AddonError> {
     let response = client.get(url).send().await?;
     let status = response.status();
     if !status.is_success() {
         return Err(AddonError::Status(status.as_u16()));
     }
-    let text = response.text().await?;
+    Ok(response.text().await?)
+}
+
+/// Downloads and checks a manifest. Returns it with the raw text, which is what gets stored.
+pub async fn fetch_manifest(
+    client: &reqwest::Client,
+    addon: &ResolvedAddon,
+) -> Result<(Manifest, String), AddonError> {
+    let text = get(client, &addon.manifest_url).await?;
     let manifest = parse_manifest(&text)?;
     Ok((manifest, text))
 }
@@ -85,12 +124,11 @@ fn resource_url(
     id: &str,
     extra: Option<(&str, &str)>,
 ) -> Result<String, AddonError> {
-    let mut url = reqwest::Url::parse(manifest_url)
-        .map_err(|_| AddonError::InvalidUrl(manifest_url.into()))?;
+    let mut url = reqwest::Url::parse(manifest_url).map_err(|_| AddonError::UnusableUrl)?;
     url.set_query(None);
     url.set_fragment(None);
     url.path_segments_mut()
-        .map_err(|()| AddonError::InvalidUrl(manifest_url.into()))?
+        .map_err(|()| AddonError::UnusableUrl)?
         .pop()
         .push(resource)
         .push(meta_type)
@@ -120,7 +158,7 @@ const EXTRA_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b')');
 
 /// The URL of a catalog: `{base}/catalog/{type}/{id}.json`.
-pub fn catalog_url(
+fn catalog_url(
     manifest_url: &str,
     meta_type: &str,
     catalog_id: &str,
@@ -130,7 +168,7 @@ pub fn catalog_url(
 
 /// The URL of a search in a catalog: `{base}/catalog/{type}/{id}/search={query}.json`, with the
 /// query percent-encoded.
-pub fn search_url(
+fn search_url(
     manifest_url: &str,
     meta_type: &str,
     catalog_id: &str,
@@ -140,11 +178,14 @@ pub fn search_url(
     resource_url(manifest_url, "catalog", meta_type, catalog_id, extra)
 }
 
-/// Downloads the first page of a catalog. An entry that lacks an id, type or name is skipped,
-/// so one bad entry does not hide the rest.
+/// Downloads the first page of a catalog, or with a `query` the results of a search in it. An
+/// entry that lacks an id, type or name is skipped, so one bad entry does not hide the rest.
 pub async fn fetch_catalog(
     client: &reqwest::Client,
-    url: &str,
+    addon: &ResolvedAddon,
+    meta_type: &str,
+    catalog_id: &str,
+    query: Option<&str>,
 ) -> Result<Vec<MetaPreview>, AddonError> {
     // shortcut: first page only, add the "skip" extra when rows need to scroll further
     #[derive(serde::Deserialize)]
@@ -152,12 +193,11 @@ pub async fn fetch_catalog(
         metas: Vec<serde_json::Value>,
     }
 
-    let response = client.get(url).send().await?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(AddonError::Status(status.as_u16()));
-    }
-    let text = response.text().await?;
+    let url = match query {
+        Some(query) => search_url(&addon.manifest_url, meta_type, catalog_id, query)?,
+        None => catalog_url(&addon.manifest_url, meta_type, catalog_id)?,
+    };
+    let text = get(client, &url).await?;
     let parsed: Response = serde_json::from_str(&text).map_err(AddonError::InvalidCatalog)?;
     Ok(parsed
         .metas
@@ -167,35 +207,32 @@ pub async fn fetch_catalog(
 }
 
 /// The URL of a meta request: `{base}/meta/{type}/{id}.json`.
-pub fn meta_url(manifest_url: &str, meta_type: &str, meta_id: &str) -> Result<String, AddonError> {
+fn meta_url(manifest_url: &str, meta_type: &str, meta_id: &str) -> Result<String, AddonError> {
     resource_url(manifest_url, "meta", meta_type, meta_id, None)
 }
 
 /// The URL of a stream request: `{base}/stream/{type}/{videoId}.json`. For a movie the video
 /// id is the meta id; for an episode it is the video's own id, such as `tt0903747:1:2`.
-pub fn stream_url(
-    manifest_url: &str,
-    meta_type: &str,
-    video_id: &str,
-) -> Result<String, AddonError> {
+fn stream_url(manifest_url: &str, meta_type: &str, video_id: &str) -> Result<String, AddonError> {
     resource_url(manifest_url, "stream", meta_type, video_id, None)
 }
 
 /// Downloads the streams an **addon** offers for one video. An entry that is not an object is
 /// skipped, so one bad entry does not hide the rest.
-pub async fn fetch_streams(client: &reqwest::Client, url: &str) -> Result<Vec<Stream>, AddonError> {
+pub async fn fetch_streams(
+    client: &reqwest::Client,
+    addon: &ResolvedAddon,
+    meta_type: &str,
+    video_id: &str,
+) -> Result<Vec<Stream>, AddonError> {
     #[derive(serde::Deserialize)]
     struct Response {
         #[serde(default)]
         streams: Option<Vec<serde_json::Value>>,
     }
 
-    let response = client.get(url).send().await?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(AddonError::Status(status.as_u16()));
-    }
-    let text = response.text().await?;
+    let url = stream_url(&addon.manifest_url, meta_type, video_id)?;
+    let text = get(client, &url).await?;
     let parsed: Response = serde_json::from_str(&text).map_err(AddonError::InvalidStreams)?;
     Ok(parsed
         .streams
@@ -207,7 +244,7 @@ pub async fn fetch_streams(client: &reqwest::Client, url: &str) -> Result<Vec<St
 
 /// The URL of a subtitles request: `{base}/subtitles/{type}/{videoId}.json`, with the same
 /// video id as a stream request.
-pub fn subtitles_url(
+fn subtitles_url(
     manifest_url: &str,
     meta_type: &str,
     video_id: &str,
@@ -219,7 +256,9 @@ pub fn subtitles_url(
 /// skipped, so one bad entry does not hide the rest.
 pub async fn fetch_subtitles(
     client: &reqwest::Client,
-    url: &str,
+    addon: &ResolvedAddon,
+    meta_type: &str,
+    video_id: &str,
 ) -> Result<Vec<Subtitle>, AddonError> {
     #[derive(serde::Deserialize)]
     struct Response {
@@ -227,12 +266,8 @@ pub async fn fetch_subtitles(
         subtitles: Option<Vec<serde_json::Value>>,
     }
 
-    let response = client.get(url).send().await?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(AddonError::Status(status.as_u16()));
-    }
-    let text = response.text().await?;
+    let url = subtitles_url(&addon.manifest_url, meta_type, video_id)?;
+    let text = get(client, &url).await?;
     let parsed: Response = serde_json::from_str(&text).map_err(AddonError::InvalidSubtitles)?;
     Ok(parsed
         .subtitles
@@ -246,7 +281,7 @@ pub async fn fetch_subtitles(
 /// whose id is the meta id, so there is always something to play.
 pub async fn fetch_meta(
     client: &reqwest::Client,
-    url: &str,
+    addon: &ResolvedAddon,
     meta_type: &str,
     meta_id: &str,
 ) -> Result<Meta, AddonError> {
@@ -255,12 +290,8 @@ pub async fn fetch_meta(
         meta: Meta,
     }
 
-    let response = client.get(url).send().await?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(AddonError::Status(status.as_u16()));
-    }
-    let text = response.text().await?;
+    let url = meta_url(&addon.manifest_url, meta_type, meta_id)?;
+    let text = get(client, &url).await?;
     let Response { mut meta } = serde_json::from_str(&text).map_err(AddonError::InvalidMeta)?;
     if meta.id.is_empty() {
         meta.id = meta_id.to_string();
@@ -316,6 +347,20 @@ mod tests {
     }
 
     #[test]
+    fn a_resolved_base_keeps_the_encoded_key_in_resource_urls() {
+        let settings = Settings {
+            real_debrid_key: Some("ab/c".into()),
+            ..Settings::default()
+        };
+        let template = "https://example.com/realdebrid={real_debrid_key}/manifest.json";
+        let addon = ResolvedAddon::resolve(template, &settings).unwrap();
+        assert_eq!(
+            stream_url(&addon.manifest_url, "movie", "tt1").unwrap(),
+            "https://example.com/realdebrid=ab%2Fc/stream/movie/tt1.json"
+        );
+    }
+
+    #[test]
     fn stremio_scheme_becomes_https() {
         assert_eq!(
             normalize_url("stremio://example.com/a/manifest.json").unwrap(),
@@ -331,6 +376,8 @@ mod tests {
     fn https_url_is_kept_as_typed() {
         let url = "https://v3-cinemeta.strem.io/manifest.json";
         assert_eq!(normalize_url(url).unwrap(), url);
+        let template = "https://example.com/realdebrid={real_debrid_key}/manifest.json";
+        assert_eq!(normalize_url(template).unwrap(), template);
     }
 
     #[test]

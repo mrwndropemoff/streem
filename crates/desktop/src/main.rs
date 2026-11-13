@@ -21,6 +21,7 @@ enum Screen {
     Search,
     /// The title in `State.details`. Back goes to `App::details_from`.
     Details,
+    Settings,
 }
 
 struct App {
@@ -36,6 +37,7 @@ struct App {
     addons: screens::addons::AddonsScreen,
     details: screens::details::DetailsScreen,
     player: screens::player::PlayerScreen,
+    settings: screens::settings::SettingsScreen,
     /// `None` when libmpv could not start. Browsing still works; playing a stream then fails.
     video: Option<MpvView>,
     /// `State.playback` was set in the last frame, so the player screen was showing.
@@ -64,6 +66,7 @@ impl App {
             addons: Default::default(),
             details: Default::default(),
             player: Default::default(),
+            settings: Default::default(),
             video,
             was_playing: false,
         }
@@ -86,7 +89,7 @@ impl App {
             }));
             return;
         };
-        video.sync(ui.ctx(), playback, &self.core);
+        video.sync(ui.ctx(), playback, &state.settings, &self.core);
         self.player.ui(ui, state, &self.core, video);
     }
 
@@ -150,6 +153,7 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.screen, Screen::Home, "Home");
                 ui.selectable_value(&mut self.screen, Screen::Library, "Library");
                 ui.selectable_value(&mut self.screen, Screen::Addons, "Addons");
+                ui.selectable_value(&mut self.screen, Screen::Settings, "Settings");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut self.search_text)
@@ -186,6 +190,7 @@ impl eframe::App for App {
                 }
             }
             Screen::Addons => self.addons.ui(ui, &state, &self.core),
+            Screen::Settings => self.settings.ui(ui, &state, &self.core),
             Screen::Details => {
                 if self.details.ui(ui, &state, &self.core) {
                     self.leave_details(self.details_from);

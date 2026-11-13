@@ -4,6 +4,7 @@ pub mod home;
 pub mod library;
 pub mod player;
 pub mod search;
+pub mod settings;
 
 use std::collections::HashMap;
 
