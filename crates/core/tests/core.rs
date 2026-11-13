@@ -2254,6 +2254,50 @@ async fn clearing_the_key_skips_the_templated_addon_and_leaves_the_others_workin
 }
 
 #[tokio::test]
+async fn a_stream_from_a_templated_addon_plays_and_a_failure_raises_the_notice() {
+    let server = MockServer::start().await;
+    serve_debrid_addon(&server, KEY).await;
+    let meta = serve_meta_addon(&server, "meta", r#""meta""#).await;
+    serve_json(
+        &server,
+        "/meta/meta/movie/tt1.json",
+        200,
+        r#"{"meta": {"id": "tt1", "type": "movie", "name": "A Film"}}"#,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    set_key(&core, Some(KEY)).await;
+    install(&core, meta, 1).await;
+    core.send(Command::InstallAddon {
+        url: debrid_template(&server),
+    });
+    wait_for(&core, "debrid installed", debrid_ready).await;
+
+    open_title(&core, "movie", "tt1").await;
+    let list = load_streams(&core, "tt1").await;
+    let debrid = group(&list, "org.example.debrid");
+    assert!(matches!(&debrid.streams, Load::Ready(items) if items[0].playable));
+    let paths = request_paths(&server).await;
+    assert!(paths.contains(&format!("/realdebrid={KEY}/stream/movie/tt1.json")));
+
+    core.send(Command::Play {
+        addon_id: "org.example.debrid".into(),
+        stream_index: 0,
+    });
+    let state = wait_for(&core, "playing", |s| s.playback.is_some()).await;
+    assert_eq!(playback(&state).url, "https://cdn.example/Film.mkv");
+
+    core.send(Command::ReportPlayback(PlaybackReport {
+        failed: Some("mpv: loading failed".into()),
+        ..report(0.0, 0.0)
+    }));
+    let state = wait_for(&core, "playback closed", |s| s.playback.is_none()).await;
+    let notice = &state.notice.as_ref().expect("a notice").text;
+    assert!(notice.contains("could not be played"), "{notice}");
+}
+
+#[tokio::test]
 async fn an_install_sent_right_after_the_key_already_uses_it() {
     let server = MockServer::start().await;
     serve_debrid_addon(&server, KEY).await;
