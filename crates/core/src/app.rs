@@ -510,13 +510,15 @@ impl App {
                     // With a key, the **addons** that need one can answer now; without one
                     // they are skipped, and there is nothing to fetch.
                     reload_home = true;
-                    to_refresh.extend(
-                        state
-                            .addons
-                            .iter()
-                            .filter(|addon| has_placeholder(&addon.url))
-                            .map(|addon| addon.url.clone()),
-                    );
+                    let templated: Vec<String> = state
+                        .addons
+                        .iter()
+                        .filter(|addon| has_placeholder(&addon.url))
+                        .map(|addon| addon.url.clone())
+                        .collect();
+                    // A fetch still running used the key before; its answer is dropped.
+                    downloading.retain(|_, url| !templated.contains(url));
+                    to_refresh.extend(templated);
                 }
             }
             if key_saved.is_some() || first_load {

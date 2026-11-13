@@ -120,7 +120,8 @@ impl Store {
     }
 
     /// Saves an **addon**. A new one goes to the end of the list; installing an
-    /// **addon** that was removed brings its row back, at the end.
+    /// **addon** that was removed brings its row back, at the end. An empty manifest (not
+    /// fetched yet) never replaces one already saved.
     pub fn upsert_addon(&self, url: &str, manifest_json: &str) -> Result<(), StoreError> {
         self.lock().execute(
             "INSERT INTO addons
@@ -131,7 +132,8 @@ impl Store {
              ON CONFLICT (account_id, url) DO UPDATE SET
                  position = CASE WHEN addons.deleted = 1 THEN excluded.position
                                  ELSE addons.position END,
-                 manifest_json = excluded.manifest_json,
+                 manifest_json = CASE WHEN excluded.manifest_json = '' THEN addons.manifest_json
+                                      ELSE excluded.manifest_json END,
                  updated_at = excluded.updated_at,
                  deleted = 0,
                  dirty = 1",
@@ -344,6 +346,14 @@ mod tests {
         assert!(store.list_addons().unwrap().is_empty());
         assert!(!store.has_no_addon_rows().unwrap());
         assert_eq!(flags(&store, url), (1, 1));
+    }
+
+    #[test]
+    fn an_empty_manifest_never_replaces_a_saved_one() {
+        let (_dir, store) = open();
+        store.upsert_addon("https://a/manifest.json", "{}").unwrap();
+        store.upsert_addon("https://a/manifest.json", "").unwrap();
+        assert_eq!(store.list_addons().unwrap()[0].manifest_json, "{}");
     }
 
     #[test]

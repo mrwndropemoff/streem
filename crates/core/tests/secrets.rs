@@ -127,6 +127,14 @@ async fn the_key_appears_in_no_log_record_notice_or_state() {
     assert!(notice.contains("could not reach the addon"), "{notice}");
     printed.push(notice);
     printed.push(format!("{state:?}"));
+    // The commands that carry the key, as a log or a failed assertion would print them.
+    printed.push(format!("{:?}", Command::SetRealDebridKey(Some(KEY.into()))));
+    printed.push(format!(
+        "{:?}",
+        Command::InstallAddon {
+            url: format!("https://a.example/realdebrid={KEY}/manifest.json"),
+        }
+    ));
 
     drop(core);
     let records = RECORDS.lock().unwrap().clone();
