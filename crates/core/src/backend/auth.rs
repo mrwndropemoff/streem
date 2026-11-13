@@ -88,7 +88,9 @@ struct TokenAnswer {
     access_token: String,
     refresh_token: String,
     expires_in: u64,
-    user: UserAnswer,
+    /// The schema lists it but requires nothing. Signing in needs it for the **account** id; a
+    /// refresh only takes the email from it.
+    user: Option<UserAnswer>,
 }
 
 #[derive(Deserialize)]
@@ -159,7 +161,10 @@ impl Auth {
             return Err(server_message(response).await);
         }
         let text = response.text().await.map_err(|_| UNREACHABLE.to_string())?;
-        let Ok(answer) = serde_json::from_str::<TokenAnswer>(&text) else {
+        let answer = serde_json::from_str::<TokenAnswer>(&text).ok();
+        let Some((answer, user)) =
+            answer.and_then(|mut answer| answer.user.take().map(|user| (answer, user)))
+        else {
             // With "Confirm email" on, sign-up answers with the new user and no tokens.
             return Err(match start {
                 Start::SignUp => "The account was created. Confirm it from the email the \
@@ -172,11 +177,8 @@ impl Auth {
         let access = (answer.access_token, expires_at(answer.expires_in));
         let saved = SavedSession {
             refresh_token: answer.refresh_token,
-            user_id: answer.user.id,
-            email: answer
-                .user
-                .email
-                .unwrap_or_else(|| email.trim().to_string()),
+            user_id: user.id,
+            email: user.email.unwrap_or_else(|| email.trim().to_string()),
         };
         self.write(&saved)
             .await
@@ -225,7 +227,7 @@ impl Auth {
         let answer: TokenAnswer = response.json().await.map_err(|_| TokenError::Unavailable)?;
 
         tokens.saved.refresh_token = answer.refresh_token;
-        if let Some(email) = answer.user.email {
+        if let Some(email) = answer.user.and_then(|user| user.email) {
             tokens.saved.email = email;
         }
         tokens.access = Some((answer.access_token.clone(), expires_at(answer.expires_in)));
@@ -519,5 +521,28 @@ mod tests {
         assert!(!dir.path().join(SESSION_FILE).exists());
         assert_eq!(restarted.access_token().await, Err(TokenError::SignedOut));
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn a_refresh_answer_without_the_user_is_accepted() {
+        let server = MockServer::start().await;
+        serve_sign_in(&server, 0).await;
+        Mock::given(method("POST"))
+            .and(path("/auth/v1/token"))
+            .and(query_param("grant_type", "refresh_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-2", "token_type": "bearer", "expires_in": 3600,
+                "refresh_token": "refresh-2",
+            })))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = auth(&server, dir.path());
+        auth.sign_in("a@example.com", "pw").await.unwrap();
+
+        assert_eq!(auth.access_token().await.unwrap(), "access-2");
+        let saved = read_session(&dir.path().join(SESSION_FILE)).unwrap();
+        assert_eq!(saved.refresh_token, "refresh-2");
+        assert_eq!(saved.account().email, "a@example.com");
     }
 }
