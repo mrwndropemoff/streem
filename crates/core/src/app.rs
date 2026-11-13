@@ -121,8 +121,9 @@ pub(crate) enum StoreOutput {
     SettingsLoaded(Settings),
     /// After saving a setting. `State` already shows it.
     SettingsSaved,
-    /// Every later job reads and writes the rows of the **account** signed in.
-    AccountSwitched,
+    /// Every later job reads and writes the rows of the **account** signed in. On an error
+    /// (text for the person) they still read and write the **account**'s before.
+    AccountSwitched(Result<(), String>),
 }
 
 /// The **addon** list as saved, after a disk job.
@@ -166,7 +167,7 @@ enum StoreJob {
     /// Reads and writes this **account**'s rows from now on, after deleting every row of
     /// another one.
     SwitchAccount {
-        user_id: String,
+        account_id: String,
     },
 }
 
@@ -562,7 +563,26 @@ impl App {
                     mark_skipped(&mut state.addons, &state.settings);
                 }
                 Message::Stored(Ok(StoreOutput::SettingsSaved)) => {}
-                Message::Stored(Ok(StoreOutput::AccountSwitched)) => switches_pending -= 1,
+                Message::Stored(Ok(StoreOutput::AccountSwitched(switched))) => {
+                    switches_pending -= 1;
+                    // Staying signed in would write rows for the **account** before, so the
+                    // person is signed out with the reason. A later switch already queued
+                    // replaces this one, so its failure no longer matters.
+                    if let Err(error) = switched
+                        && switches_pending == 0
+                        && let Some(auth) = &auth
+                    {
+                        auth_generation += 1;
+                        state.session = Session::Working;
+                        forget_account = true;
+                        let auth = auth.clone();
+                        let text = format!("Could not open this account on this device: {error}");
+                        spawn_auth(&self.sender, auth_generation, async move {
+                            auth.sign_out().await;
+                            AuthEvent::Failed(text)
+                        });
+                    }
+                }
                 Message::Command(
                     Command::SignUp {
                         ref email,
@@ -619,7 +639,7 @@ impl App {
                                 email: account.email,
                             };
                             forget_account = true;
-                            open_account = Some(account.user_id);
+                            open_account = Some(account.account_id);
                             if restored && let Some(auth) = &auth {
                                 // Signed in at once; the refresh only finds out whether the
                                 // server still accepts the session.
@@ -691,9 +711,9 @@ impl App {
                 key_set = false;
                 languages_set = false;
             }
-            if let Some(user_id) = open_account {
+            if let Some(account_id) = open_account {
                 switches_pending += 1;
-                let _ = jobs.send(StoreJob::SwitchAccount { user_id });
+                let _ = jobs.send(StoreJob::SwitchAccount { account_id });
                 load_account(&jobs);
             }
 
@@ -850,7 +870,7 @@ fn needs_account(command: &Command) -> bool {
 fn is_account_data(output: &StoreOutput) -> bool {
     !matches!(
         output,
-        StoreOutput::AccountSwitched | StoreOutput::SettingsSaved
+        StoreOutput::AccountSwitched(_) | StoreOutput::SettingsSaved
     )
 }
 
@@ -1239,9 +1259,12 @@ fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
         StoreJob::Remove { url } => store.remove_addon(&url)?,
         StoreJob::Library(job) => return run_library_job(store, job),
         StoreJob::Settings(job) => return run_settings_job(store, job),
-        StoreJob::SwitchAccount { user_id } => {
-            store.switch_account(&user_id)?;
-            return Ok(StoreOutput::AccountSwitched);
+        StoreJob::SwitchAccount { account_id } => {
+            let switched = store
+                .switch_account(&account_id)
+                .map(drop)
+                .map_err(|error| error.to_string());
+            return Ok(StoreOutput::AccountSwitched(switched));
         }
     }
     let mut addons = Vec::new();

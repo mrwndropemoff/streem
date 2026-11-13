@@ -46,7 +46,7 @@ impl SignInScreen {
         let mut sign_in = false;
         let mut sign_up = false;
         ui.add_enabled_ui(enabled, |ui| {
-            ui.add(
+            let email = ui.add(
                 egui::TextEdit::singleline(&mut self.email)
                     .hint_text("Email")
                     .desired_width(FIELD_WIDTH),
@@ -58,8 +58,9 @@ impl SignInScreen {
                     .desired_width(FIELD_WIDTH),
             );
             let ready = !self.email.trim().is_empty() && !self.password.is_empty();
-            let enter =
-                password.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            // Enter in either field.
+            let enter = (email.lost_focus() || password.lost_focus())
+                && ui.input(|input| input.key_pressed(egui::Key::Enter));
             sign_in = ready && enter;
             ui.add_space(8.0);
             sign_in |= ui

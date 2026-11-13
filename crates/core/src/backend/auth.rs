@@ -23,11 +23,27 @@ const SESSION_FILE: &str = "session.json";
 /// An access token with less time left than this is refreshed before it is handed out.
 const REFRESH_MARGIN: Duration = Duration::from_secs(60);
 
-/// Who is signed in to the **account**.
+/// The **account** signed in to: its id (Supabase's user id) and its email.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Account {
-    pub(crate) user_id: String,
+    pub(crate) account_id: String,
     pub(crate) email: String,
+}
+
+/// Which endpoint starts a session.
+#[derive(Clone, Copy)]
+enum Start {
+    SignUp,
+    SignIn,
+}
+
+impl Start {
+    fn path(self) -> &'static str {
+        match self {
+            Start::SignUp => "/auth/v1/signup",
+            Start::SignIn => "/auth/v1/token?grant_type=password",
+        }
+    }
 }
 
 /// Why [`Auth::access_token`] gave no token.
@@ -48,6 +64,15 @@ struct SavedSession {
     refresh_token: String,
     user_id: String,
     email: String,
+}
+
+impl SavedSession {
+    fn account(&self) -> Account {
+        Account {
+            account_id: self.user_id.clone(),
+            email: self.email.clone(),
+        }
+    }
 }
 
 /// The tokens of the person signed in.
@@ -100,38 +125,34 @@ impl Auth {
             .await
             .ok()
             .flatten()?;
-        let signed_in = Account {
-            user_id: saved.user_id.clone(),
-            email: saved.email.clone(),
-        };
+        let account = saved.account();
         *tokens = Some(Tokens {
             saved,
             access: None,
         });
-        Some(signed_in)
+        Some(account)
     }
 
     /// Creates an **account** and signs in to it. The error is text for the person.
     pub(crate) async fn sign_up(&self, email: &str, password: &str) -> Result<Account, String> {
-        self.start_session("/auth/v1/signup", email, password).await
+        self.start_session(Start::SignUp, email, password).await
     }
 
     /// Signs in to an existing **account**. The error is text for the person.
     pub(crate) async fn sign_in(&self, email: &str, password: &str) -> Result<Account, String> {
-        self.start_session("/auth/v1/token?grant_type=password", email, password)
-            .await
+        self.start_session(Start::SignIn, email, password).await
     }
 
     async fn start_session(
         &self,
-        path: &str,
+        start: Start,
         email: &str,
         password: &str,
     ) -> Result<Account, String> {
         let mut tokens = self.tokens.lock().await;
         let body = json!({ "email": email, "password": password });
         let response = self
-            .post(path, Some(body), None)
+            .post(start.path(), Some(body), None)
             .await
             .map_err(|_| UNREACHABLE.to_string())?;
         if !response.status().is_success() {
@@ -140,12 +161,11 @@ impl Auth {
         let text = response.text().await.map_err(|_| UNREACHABLE.to_string())?;
         let Ok(answer) = serde_json::from_str::<TokenAnswer>(&text) else {
             // With "Confirm email" on, sign-up answers with the new user and no tokens.
-            return Err(if path.ends_with("/signup") {
-                "The account was created. Confirm it from the email the server sent, \
-                 then sign in."
-                    .to_string()
-            } else {
-                "The server's answer could not be read.".to_string()
+            return Err(match start {
+                Start::SignUp => "The account was created. Confirm it from the email the \
+                                  server sent, then sign in."
+                    .to_string(),
+                Start::SignIn => "The server's answer could not be read.".to_string(),
             });
         };
 
@@ -161,15 +181,12 @@ impl Auth {
         self.write(&saved)
             .await
             .map_err(|error| format!("Could not save the session: {error}"))?;
-        let signed_in = Account {
-            user_id: saved.user_id.clone(),
-            email: saved.email.clone(),
-        };
+        let account = saved.account();
         *tokens = Some(Tokens {
             saved,
             access: Some(access),
         });
-        Ok(signed_in)
+        Ok(account)
     }
 
     /// A valid access token for requests to the sync backend. It is refreshed first when it
@@ -177,6 +194,11 @@ impl Auth {
     /// `streem-core` gets its token only from here.
     pub(crate) async fn access_token(&self) -> Result<String, TokenError> {
         let mut guard = self.tokens.lock().await;
+        self.valid_token(&mut guard).await
+    }
+
+    /// [`Auth::access_token`], for a caller already holding the lock.
+    async fn valid_token(&self, guard: &mut Option<Tokens>) -> Result<String, TokenError> {
         let tokens = guard.as_mut().ok_or(TokenError::SignedOut)?;
         if let Some((token, expires_at)) = &tokens.access
             && expires_at.saturating_duration_since(Instant::now()) >= REFRESH_MARGIN
@@ -215,17 +237,16 @@ impl Auth {
 
     /// Tells the server this device signs out, ignoring any failure, then forgets the session
     /// and deletes `session.json`. Only this device's session ends; others stay signed in.
+    /// Logging out needs an access token, so one is fetched first if there is none, as after a
+    /// restart.
     pub(crate) async fn sign_out(&self) {
-        let mut tokens = self.tokens.lock().await;
-        if let Some(Tokens {
-            access: Some((access, _)),
-            ..
-        }) = tokens.take()
-        {
+        let mut guard = self.tokens.lock().await;
+        if let Ok(access) = self.valid_token(&mut guard).await {
             let _ = self
                 .post("/auth/v1/logout?scope=local", None, Some(&access))
                 .await;
         }
+        *guard = None;
         self.delete().await;
     }
 
@@ -403,7 +424,7 @@ mod tests {
         for expected in ["access-refresh-2", "access-refresh-3"] {
             let restarted = auth(&server, dir.path());
             let signed_in = restarted.restore().await.unwrap();
-            assert_eq!(signed_in.user_id, "user-1");
+            assert_eq!(signed_in.account_id, "user-1");
             assert_eq!(restarted.access_token().await.unwrap(), expected);
         }
     }
@@ -469,5 +490,34 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("Confirm"), "{error}");
         assert!(!dir.path().join(SESSION_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn signing_out_after_a_restart_fetches_a_token_to_log_out_with() {
+        let server = MockServer::start().await;
+        serve_sign_in(&server, 3600).await;
+        serve_refresh(&server, "refresh-1", "refresh-2").await;
+        Mock::given(method("POST"))
+            .and(path("/auth/v1/logout"))
+            .and(query_param("scope", "local"))
+            .and(header("apikey", KEY))
+            .and(header("authorization", "Bearer access-refresh-2"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        auth(&server, dir.path())
+            .sign_in("a@example.com", "pw")
+            .await
+            .unwrap();
+
+        let restarted = auth(&server, dir.path());
+        restarted.restore().await.unwrap();
+        restarted.sign_out().await;
+
+        assert!(!dir.path().join(SESSION_FILE).exists());
+        assert_eq!(restarted.access_token().await, Err(TokenError::SignedOut));
+        server.verify().await;
     }
 }

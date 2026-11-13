@@ -3,6 +3,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
@@ -309,18 +310,65 @@ async fn a_rejected_refresh_token_gives_signed_out() {
 async fn a_refresh_that_cannot_connect_stays_signed_in() {
     let server = supabase().await;
     let dir = signed_in_before(&server).await;
-    let nowhere = BackendConfig {
-        url: "http://127.0.0.1:9".into(),
+    // Closes every connection as soon as it is made, so the refresh fails without an answer.
+    // Counting the connections tells when it was tried; a refused port gives no such sign, and
+    // on Windows takes seconds to fail.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counted = attempts.clone();
+    std::thread::spawn(move || {
+        for connection in listener.incoming() {
+            counted.fetch_add(1, Ordering::SeqCst);
+            drop(connection);
+        }
+    });
+    let closing = BackendConfig {
+        url: format!("http://{address}"),
         key: KEY.into(),
     };
 
-    let core = start(dir.path(), nowhere);
+    let core = start(dir.path(), closing);
     wait_for(&core, "signed in", signed_in).await;
-    // Long enough for the refresh to fail: nothing listens, so it fails at once.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    for _ in 0..250 {
+        if attempts.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        attempts.load(Ordering::SeqCst) > 0,
+        "the refresh was never tried"
+    );
+    // Time for the failure to reach `Core`.
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert!(signed_in(&core.state()), "{:?}", core.state().session);
     assert!(dir.path().join("session.json").exists());
+}
+
+#[tokio::test]
+async fn an_account_that_cannot_be_opened_on_this_device_signs_out_with_the_reason() {
+    let server = supabase().await;
+    let dir = signed_in_before(&server).await;
+    // Breaks the switch to the **account**: the table it records the **account** in is gone.
+    rusqlite::Connection::open(dir.path().join("streem.db"))
+        .unwrap()
+        .execute("DROP TABLE local_state", [])
+        .unwrap();
+
+    let core = start(dir.path(), backend(&server));
+    let state = wait_for(&core, "an error", |s| {
+        matches!(s.session, Session::SignedOut { error: Some(_) })
+    })
+    .await;
+
+    let Session::SignedOut { error: Some(error) } = &state.session else {
+        unreachable!()
+    };
+    assert!(error.starts_with("Could not open this account"), "{error}");
+    assert!(state.addons.is_empty());
+    assert!(!dir.path().join("session.json").exists());
 }
 
 #[tokio::test]

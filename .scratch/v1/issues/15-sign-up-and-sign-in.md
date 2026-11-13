@@ -91,9 +91,9 @@ Use `reqwest` directly; do not add a Supabase SDK crate. Every request carries t
 
 ## Acceptance checks
 
-- [ ] `cargo test -p streem-core` passes, including tests against a `wiremock` server standing in for Supabase that: `SignUp` reaches `SignedIn` and writes `session.json`; `SignIn` with a rejected password reaches `SignedOut` with the server's message; a new `Core` on the same data directory starts as `SignedIn` and calls the refresh endpoint; a rejected refresh token gives `SignedOut`; a refresh that cannot connect stays `SignedIn`; `SignOut` deletes `session.json`; signing in as a second user id empties the `addons` table; a token with 30 seconds left is refreshed before use; every request carries the `apikey` header.
+- [x] `cargo test -p streem-core` passes, including tests against a `wiremock` server standing in for Supabase that: `SignUp` reaches `SignedIn` and writes `session.json`; `SignIn` with a rejected password reaches `SignedOut` with the server's message; a new `Core` on the same data directory starts as `SignedIn` and calls the refresh endpoint; a rejected refresh token gives `SignedOut`; a refresh that cannot connect stays `SignedIn`; `SignOut` deletes `session.json`; signing in as a second user id empties the `addons` table; a token with 30 seconds left is refreshed before use; every request carries the `apikey` header.
 - [ ] On Unix a test asserts `session.json` has mode `0600`.
-- [ ] A test captures the log output of a sign-in and asserts neither the password nor a token appears.
+- [x] A test captures the log output of a sign-in and asserts neither the password nor a token appears.
 - [ ] `cargo run -p streem-desktop`: create an account, see the app, restart, still signed in, sign out, sign in again.
 
 ## Rules
@@ -107,3 +107,11 @@ Use `reqwest` directly; do not add a Supabase SDK crate. Every request carries t
 - When done, tick the boxes and add a line under `## Comments` saying what you verified and how.
 
 ## Comments
+- 2026-11-13, agent: Implemented on branch `ticket-15-sign-up-and-sign-in`. Verified on Windows: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` all pass. The `wiremock` tests are in `crates/core/tests/auth.rs`; the log-capture test is `crates/core/tests/auth_logs.rs`, and it checks that each secret really reached the server and that reqwest and hyper_util records were captured. The 30-seconds-left refresh is a unit test in `crates/core/src/backend/auth.rs`. Mutation check: when a connection failure was made to count as a rejection, the cannot-connect test failed.
+  - Box 2 is not ticked: `the_session_file_is_readable_by_its_owner_only` is `cfg(unix)` and has not run yet. CI's ubuntu job will run it.
+  - Box 4 is not ticked: ticket 14 is not done, so there is no `.cargo/config.toml`, and `cargo run -p streem-desktop` shows "The sync backend is not configured. See ticket 14." Do this check once 14 is done.
+  - Decision: with no `BackendConfig` (`NotConfigured`), `Core` keeps the behaviour from before this ticket: rows under account `local`, and default addons installed at startup. This keeps the existing test suite offline. `Core::start_with_options` takes both a backend and the default addon list so tests can do both.
+  - Decision: sign-out posts to `/auth/v1/logout?scope=local`. Supabase's default scope is `global`, which would sign out every device of the shared **account**. When there is no access token (after a restart), sign-out refreshes first so it can call logout.
+  - Decision: on refresh, a 4xx other than 429 counts as rejected. A network failure, a 5xx or a 429 keeps the person signed in and retries every 30 s, so a paused free project does not sign anyone out.
+  - Decision: if switching the local data to the signed-in **account** fails, the person is signed out with the reason, rather than rows being written for the previous **account**.
+  - Left for later: the reset of per-**account** values in `App::run` (`forget_account`) is a long list of loop locals. Ticket 16 adds sync state and may want them gathered into one struct.
