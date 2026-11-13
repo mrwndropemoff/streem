@@ -12,14 +12,16 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::addon::client::{
-    catalog_url, fetch_catalog, fetch_manifest, fetch_meta, fetch_streams, fetch_subtitles,
-    http_client, meta_url, normalize_url, parse_manifest, search_url, stream_url, subtitles_url,
+    AddonBase, fetch_catalog, fetch_manifest, fetch_meta, fetch_streams, fetch_subtitles,
+    http_client, normalize_url, parse_manifest,
 };
 use crate::addon::types::{
     Manifest, ManifestCatalog, Meta, MetaPreview, Stream, StreamSource, is_http,
 };
+use crate::addon::url::{has_placeholder, templatize};
 use crate::playback::{self, Links, Reported};
 use crate::posters::{self, Poster, PosterCache};
+use crate::settings::{self, Settings};
 use crate::store::{Store, StoreError, StoredAddon};
 use crate::{
     CatalogRow, Command, Details, InstalledAddon, Load, Notice, Playback, Search, State,
@@ -82,15 +84,20 @@ pub(crate) enum RowList {
     Search,
 }
 
-/// The **addon** list as saved, after a disk job.
+/// The **addon** list and the settings as saved, after a disk job.
 pub(crate) struct StoreOutput {
     addons: Vec<InstalledAddon>,
+    settings: Settings,
+    /// The job was a startup load, an install or a removal.
+    addons_changed: bool,
+    /// The job saved a Real-Debrid key different from the one saved before.
+    key_changed: bool,
     /// The catalogs the home screen can show, from the saved manifests.
     catalogs: Vec<CatalogSource>,
     /// The catalogs a search asks, from the saved manifests.
     search_catalogs: Vec<CatalogSource>,
     /// The saved manifests, by **addon** URL, in **addon** order. Used to pick who answers a
-    /// meta request.
+    /// meta request. An **addon** whose manifest was never fetched is not here.
     manifests: Vec<(String, Manifest)>,
     /// Set by the first load only: the data directory had no **addon** rows at all.
     first_launch: bool,
@@ -106,8 +113,20 @@ struct CatalogSource {
 
 enum StoreJob {
     Load,
-    Upsert { url: String, manifest_json: String },
-    Remove { url: String },
+    /// An empty manifest saves an **addon** whose manifest cannot be fetched until a
+    /// Real-Debrid key is saved.
+    Upsert {
+        url: String,
+        manifest_json: String,
+    },
+    Remove {
+        url: String,
+    },
+    SaveRealDebridKey(Option<String>),
+    SaveLanguages {
+        audio: Option<String>,
+        subtitle: Option<String>,
+    },
 }
 
 pub(crate) struct App {
@@ -175,6 +194,8 @@ impl App {
             let Some(message) = message else { break };
 
             let mut to_install = Vec::new();
+            // Installed **addons** whose manifest is fetched again, by stored URL.
+            let mut to_refresh = Vec::new();
             let mut reload_home = false;
             // Set when the state changed only by a position nobody needs to hear about yet.
             let mut hold_back = false;
@@ -219,6 +240,7 @@ impl App {
                             &client,
                             &self.sender,
                             &search_catalogs,
+                            &state.settings,
                             Some(query),
                             RowList::Search,
                             search_generation,
@@ -238,6 +260,7 @@ impl App {
                         &client,
                         &self.sender,
                         &manifests,
+                        &state.settings,
                         &meta_type,
                         &meta_id,
                         details_generation,
@@ -264,6 +287,7 @@ impl App {
                             &client,
                             &self.sender,
                             &manifests,
+                            &state.settings,
                             &details.meta_type,
                             video_id,
                             streams_generation,
@@ -285,6 +309,7 @@ impl App {
                             &client,
                             &self.sender,
                             &manifests,
+                            &state.settings,
                             playback,
                             playback_generation,
                         );
@@ -366,6 +391,17 @@ impl App {
                     let _ = jobs.send(StoreJob::Remove { url });
                 }
                 Message::Command(Command::DismissNotice) => state.notice = None,
+                // Settings change in `State` once they are saved, so the state always shows
+                // what is on disk.
+                Message::Command(Command::SetRealDebridKey(key)) => {
+                    let _ = jobs.send(StoreJob::SaveRealDebridKey(settings::clean(key)));
+                }
+                Message::Command(Command::SetPlaybackLanguages { audio, subtitle }) => {
+                    let _ = jobs.send(StoreJob::SaveLanguages {
+                        audio: settings::clean(audio),
+                        subtitle: settings::clean(subtitle),
+                    });
+                }
                 Message::Fetched(id, result) => {
                     // Not in the map: the **addon** was removed while it was downloading.
                     if let Some(url) = downloading.remove(&id) {
@@ -381,11 +417,22 @@ impl App {
                 }
                 Message::Stored(Ok(output)) => {
                     state.addons = output.addons;
-                    // Every finished disk job is a startup load, an install or a removal.
+                    state.settings = output.settings;
                     catalogs = output.catalogs;
                     search_catalogs = output.search_catalogs;
                     manifests = output.manifests;
-                    reload_home = true;
+                    reload_home = output.addons_changed || output.key_changed;
+                    if output.key_changed {
+                        // With a key, the **addons** that need one can answer now; without
+                        // one they are skipped, and there is nothing to fetch.
+                        to_refresh.extend(
+                            state
+                                .addons
+                                .iter()
+                                .filter(|addon| has_placeholder(&addon.url))
+                                .map(|addon| addon.url.clone()),
+                        );
+                    }
                     if output.first_launch {
                         to_install.extend(self.default_addon_urls.iter().cloned());
                     }
@@ -401,6 +448,7 @@ impl App {
                     &client,
                     &self.sender,
                     &catalogs,
+                    &state.settings,
                     None,
                     RowList::Home,
                     home_generation,
@@ -408,17 +456,37 @@ impl App {
             }
 
             for input in to_install {
-                match normalize_url(&input) {
-                    Ok(url) => {
-                        let id = next_download_id;
-                        next_download_id += 1;
-                        downloading.insert(id, url.clone());
-                        spawn_download(&client, self.sender.clone(), id, url, input);
-                    }
+                // First, so that no notice below can show the key.
+                let input = templatize(&input, &state.settings);
+                let url = match normalize_url(&input) {
+                    Ok(url) => url,
                     Err(error) => {
                         let text = format!("Could not install {}: {error}", input.trim());
                         state.notice = Some(notice(&mut next_notice_id, text));
+                        continue;
                     }
+                };
+                match AddonBase::resolve(&url, &state.settings) {
+                    Ok(addon) => {
+                        let id = next_download_id;
+                        next_download_id += 1;
+                        downloading.insert(id, url.clone());
+                        spawn_download(&client, self.sender.clone(), id, addon, "install", url);
+                    }
+                    // Listed and skipped until a key is saved, which fetches its manifest.
+                    Err(_) if state.addons.iter().any(|addon| addon.url == url) => {}
+                    Err(_) => {
+                        let manifest_json = String::new();
+                        let _ = jobs.send(StoreJob::Upsert { url, manifest_json });
+                    }
+                }
+            }
+            for url in to_refresh {
+                if let Ok(addon) = AddonBase::resolve(&url, &state.settings) {
+                    let id = next_download_id;
+                    next_download_id += 1;
+                    downloading.insert(id, url.clone());
+                    spawn_download(&client, self.sender.clone(), id, addon, "refresh", url);
                 }
             }
             if !hold_back {
@@ -449,6 +517,15 @@ impl App {
                         let _ = jobs.send(StoreJob::Upsert { url, manifest_json });
                     }
                 }
+                Message::Command(Command::SetRealDebridKey(key)) => {
+                    let _ = jobs.send(StoreJob::SaveRealDebridKey(settings::clean(key)));
+                }
+                Message::Command(Command::SetPlaybackLanguages { audio, subtitle }) => {
+                    let _ = jobs.send(StoreJob::SaveLanguages {
+                        audio: settings::clean(audio),
+                        subtitle: settings::clean(subtitle),
+                    });
+                }
                 _ => {}
             }
         }
@@ -463,37 +540,44 @@ fn notice(next_id: &mut u64, text: String) -> Notice {
     Notice { id, text }
 }
 
-/// Downloads and checks the manifest in the background, then reports back.
+/// Downloads and checks the manifest in the background, then reports back. A failure says
+/// "Could not {verb} {url}", where `url` is the stored one, never the resolved one.
 fn spawn_download(
     client: &reqwest::Client,
     sender: mpsc::UnboundedSender<Message>,
     id: u64,
+    addon: AddonBase,
+    verb: &'static str,
     url: String,
-    input: String,
 ) {
     let client = client.clone();
     tokio::spawn(async move {
-        let result = fetch_manifest(&client, &url)
+        let result = fetch_manifest(&client, &addon)
             .await
             .map(|(_manifest, text)| text)
-            .map_err(|error| format!("Could not install {}: {error}", input.trim()));
+            .map_err(|error| format!("Could not {verb} {url}: {error}"));
         let _ = sender.send(Message::Fetched(id, result));
     });
 }
 
 /// Builds a `Loading` row for each catalog and fetches them all at once: the catalog itself,
 /// or with a `query` a search in it. Each row is answered on its own, so one failing **addon**
-/// never touches the others.
+/// never touches the others. An **addon** that is skipped for want of a key gets no row.
 fn start_rows(
     client: &reqwest::Client,
     sender: &mpsc::UnboundedSender<Message>,
     catalogs: &[CatalogSource],
+    settings: &Settings,
     query: Option<&str>,
     list: RowList,
     generation: u64,
 ) -> Vec<CatalogRow> {
     let mut rows = Vec::with_capacity(catalogs.len());
-    for (row, source) in catalogs.iter().enumerate() {
+    for source in catalogs {
+        let Ok(addon) = AddonBase::resolve(&source.addon_url, settings) else {
+            continue;
+        };
+        let row = rows.len();
         rows.push(CatalogRow {
             addon_name: source.addon_name.clone(),
             catalog_name: source.catalog.display_name().to_string(),
@@ -503,18 +587,17 @@ fn start_rows(
 
         let client = client.clone();
         let sender = sender.clone();
-        let addon_url = source.addon_url.clone();
         let catalog = source.catalog.clone();
         let query = query.map(str::to_string);
         tokio::spawn(async move {
-            let url = match &query {
-                Some(query) => search_url(&addon_url, &catalog.kind, &catalog.id, query),
-                None => catalog_url(&addon_url, &catalog.kind, &catalog.id),
-            };
-            let result = match url {
-                Ok(url) => fetch_catalog(&client, &url).await,
-                Err(error) => Err(error),
-            };
+            let result = fetch_catalog(
+                &client,
+                &addon,
+                &catalog.kind,
+                &catalog.id,
+                query.as_deref(),
+            )
+            .await;
             let result = result.map_err(|error| error.to_string());
             let _ = sender.send(Message::Catalog {
                 list,
@@ -528,19 +611,21 @@ fn start_rows(
 }
 
 /// Picks the **addon** to ask about a title: the first installed one that offers `meta` for
-/// the type and id. Fetches in the background and returns `Loading`, or `Failed` when no
-/// **addon** matches.
+/// the type and id and is not skipped for want of a key. Fetches in the background and
+/// returns `Loading`, or `Failed` when no **addon** matches.
 fn start_meta(
     client: &reqwest::Client,
     sender: &mpsc::UnboundedSender<Message>,
     manifests: &[(String, Manifest)],
+    settings: &Settings,
     meta_type: &str,
     meta_id: &str,
     generation: u64,
 ) -> Load<Meta> {
-    let Some((addon_url, _)) = manifests
+    let Some(addon) = manifests
         .iter()
-        .find(|(_, manifest)| manifest.offers("meta", meta_type, meta_id))
+        .filter(|(_, manifest)| manifest.offers("meta", meta_type, meta_id))
+        .find_map(|(addon_url, _)| AddonBase::resolve(addon_url, settings).ok())
     else {
         return Load::Failed(format!(
             "No installed addon can describe {meta_type} {meta_id}."
@@ -549,14 +634,10 @@ fn start_meta(
 
     let client = client.clone();
     let sender = sender.clone();
-    let addon_url = addon_url.clone();
     let meta_type = meta_type.to_string();
     let meta_id = meta_id.to_string();
     tokio::spawn(async move {
-        let result = match meta_url(&addon_url, &meta_type, &meta_id) {
-            Ok(url) => fetch_meta(&client, &url, &meta_type, &meta_id).await,
-            Err(error) => Err(error),
-        };
+        let result = fetch_meta(&client, &addon, &meta_type, &meta_id).await;
         let result = result.map_err(|error| error.to_string());
         let _ = sender.send(Message::Meta { generation, result });
     });
@@ -565,11 +646,13 @@ fn start_meta(
 
 /// Builds a `Loading` group for every installed **addon** that offers `stream` for the type and
 /// video id, and fetches them all at once. Each group is answered on its own, so one failing
-/// **addon** never touches the others. Returns the **addon** URL of each group with the list.
+/// **addon** never touches the others. An **addon** that is skipped for want of a key gets no
+/// group. Returns the stored **addon** URL of each group with the list.
 fn start_streams(
     client: &reqwest::Client,
     sender: &mpsc::UnboundedSender<Message>,
     manifests: &[(String, Manifest)],
+    settings: &Settings,
     meta_type: &str,
     video_id: String,
     generation: u64,
@@ -580,6 +663,9 @@ fn start_streams(
         if !manifest.offers("stream", meta_type, &video_id) {
             continue;
         }
+        let Ok(addon) = AddonBase::resolve(addon_url, settings) else {
+            continue;
+        };
         sources.push(addon_url.clone());
         groups.push(StreamGroup {
             addon_id: manifest.id.clone(),
@@ -593,10 +679,7 @@ fn start_streams(
         let meta_type = meta_type.to_string();
         let video_id = video_id.clone();
         tokio::spawn(async move {
-            let result = match stream_url(&addon_url, &meta_type, &video_id) {
-                Ok(url) => fetch_streams(&client, &url).await,
-                Err(error) => Err(error),
-            };
+            let result = fetch_streams(&client, &addon, &meta_type, &video_id).await;
             let result = result.map_err(|error| error.to_string());
             let _ = sender.send(Message::Streams {
                 generation,
@@ -611,11 +694,13 @@ fn start_streams(
 /// Asks every installed **addon** that offers `subtitles` for the playing video, all at once.
 /// Each answer comes back on its own; a failing **addon** is ignored silently, because missing
 /// subtitles must never stop playback or raise a notice. Only `http://` and `https://` links
-/// are kept, since the player opens whatever it is given.
+/// are kept, since the player opens whatever it is given. An **addon** that is skipped for
+/// want of a key is not asked.
 fn start_subtitles(
     client: &reqwest::Client,
     sender: &mpsc::UnboundedSender<Message>,
     manifests: &[(String, Manifest)],
+    settings: &Settings,
     playback: &Playback,
     generation: u64,
 ) {
@@ -623,13 +708,17 @@ fn start_subtitles(
         if !manifest.offers("subtitles", &playback.meta_type, &playback.video_id) {
             continue;
         }
+        let Ok(addon) = AddonBase::resolve(addon_url, settings) else {
+            continue;
+        };
         let client = client.clone();
         let sender = sender.clone();
-        let url = subtitles_url(addon_url, &playback.meta_type, &playback.video_id);
+        let meta_type = playback.meta_type.clone();
+        let video_id = playback.video_id.clone();
         let addon_name = manifest.name.clone();
         tokio::spawn(async move {
-            let Ok(url) = url else { return };
-            let Ok(subtitles) = fetch_subtitles(&client, &url).await else {
+            let Ok(subtitles) = fetch_subtitles(&client, &addon, &meta_type, &video_id).await
+            else {
                 return;
             };
             let tracks = subtitles
@@ -718,17 +807,33 @@ async fn store_worker(
 
 fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
     let mut first_launch = false;
+    let mut addons_changed = true;
+    let mut key_changed = false;
     match job {
         StoreJob::Load => first_launch = store.has_no_addon_rows()?,
         StoreJob::Upsert { url, manifest_json } => store.upsert_addon(&url, &manifest_json)?,
         StoreJob::Remove { url } => store.remove_addon(&url)?,
+        StoreJob::SaveRealDebridKey(key) => {
+            addons_changed = false;
+            key_changed = store.load_settings()?.key() != key.as_deref();
+            store.save_real_debrid_key(key.as_deref())?;
+        }
+        StoreJob::SaveLanguages { audio, subtitle } => {
+            addons_changed = false;
+            store.save_languages(audio.as_deref(), subtitle.as_deref())?;
+        }
     }
+    let settings = store.load_settings()?;
     let mut addons = Vec::new();
     let mut catalogs = Vec::new();
     let mut search_catalogs = Vec::new();
     let mut manifests = Vec::new();
     for stored in store.list_addons()? {
-        let Some((addon, manifest)) = installed_addon(stored) else {
+        let Some((addon, manifest)) = installed_addon(stored, &settings) else {
+            continue;
+        };
+        let Some(manifest) = manifest else {
+            addons.push(addon);
             continue;
         };
         for catalog in &manifest.catalogs {
@@ -749,6 +854,9 @@ fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
     }
     Ok(StoreOutput {
         addons,
+        settings,
+        addons_changed,
+        key_changed,
         catalogs,
         search_catalogs,
         manifests,
@@ -756,9 +864,30 @@ fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
     })
 }
 
+/// Returns the **addon** with its manifest, or with none when the manifest was never fetched.
 /// A saved row whose manifest can no longer be read is left out of the list.
-/// Returns the **addon** with its manifest.
-fn installed_addon(stored: StoredAddon) -> Option<(InstalledAddon, Manifest)> {
+fn installed_addon(
+    stored: StoredAddon,
+    settings: &Settings,
+) -> Option<(InstalledAddon, Option<Manifest>)> {
+    let skipped_reason = AddonBase::resolve(&stored.url, settings)
+        .err()
+        .map(|missing| missing.to_string());
+    if stored.manifest_json.is_empty() {
+        let name = reqwest::Url::parse(&stored.url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| stored.url.clone());
+        let addon = InstalledAddon {
+            url: stored.url,
+            id: String::new(),
+            name,
+            version: String::new(),
+            description: String::new(),
+            skipped_reason,
+        };
+        return Some((addon, None));
+    }
     let manifest = parse_manifest(&stored.manifest_json).ok()?;
     let addon = InstalledAddon {
         url: stored.url,
@@ -766,6 +895,7 @@ fn installed_addon(stored: StoredAddon) -> Option<(InstalledAddon, Manifest)> {
         name: manifest.name.clone(),
         version: manifest.version.clone(),
         description: manifest.description.clone().unwrap_or_default(),
+        skipped_reason,
     };
-    Some((addon, manifest))
+    Some((addon, Some(manifest)))
 }

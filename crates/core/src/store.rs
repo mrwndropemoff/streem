@@ -6,7 +6,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::settings::Settings;
 
 /// Until sign-in exists, every row belongs to this **account**.
 pub const LOCAL_ACCOUNT: &str = "local";
@@ -25,6 +27,16 @@ const MIGRATIONS: &[&str] = &[
         dirty         INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (account_id, url)
     )",
+    // 2: the **account**'s settings, one row per **account**. `dirty` and `updated_at` are
+    // used by sync.
+    "CREATE TABLE account_settings (
+        account_id      TEXT PRIMARY KEY,
+        real_debrid_key TEXT,
+        audio_lang      TEXT,
+        subtitle_lang   TEXT,
+        updated_at      INTEGER,
+        dirty           INTEGER
+    )",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -35,7 +47,9 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
 }
 
-/// An **addon** row as saved: its URL and the manifest text the **addon** served.
+/// An **addon** row as saved: its URL and the manifest text the **addon** served. The manifest
+/// is empty while it has not been fetched yet: an **addon** whose URL has a placeholder,
+/// installed while no Real-Debrid key was saved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredAddon {
     pub url: String,
@@ -105,6 +119,60 @@ impl Store {
                  deleted = 0,
                  dirty = 1",
             params![LOCAL_ACCOUNT, url, manifest_json, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// The **account**'s settings; all unset when none were ever saved.
+    pub fn load_settings(&self) -> Result<Settings, StoreError> {
+        let settings = self
+            .lock()
+            .query_row(
+                "SELECT real_debrid_key, audio_lang, subtitle_lang FROM account_settings
+                 WHERE account_id = ?1",
+                params![LOCAL_ACCOUNT],
+                |row| {
+                    Ok(Settings {
+                        real_debrid_key: row.get(0)?,
+                        audio_lang: row.get(1)?,
+                        subtitle_lang: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(settings.unwrap_or_default())
+    }
+
+    /// Saves the Real-Debrid key, leaving the other settings as they are.
+    pub fn save_real_debrid_key(&self, key: Option<&str>) -> Result<(), StoreError> {
+        self.lock().execute(
+            "INSERT INTO account_settings (account_id, real_debrid_key, updated_at, dirty)
+             VALUES (?1, ?2, ?3, 1)
+             ON CONFLICT (account_id) DO UPDATE SET
+                 real_debrid_key = excluded.real_debrid_key,
+                 updated_at = excluded.updated_at,
+                 dirty = 1",
+            params![LOCAL_ACCOUNT, key, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// Saves the preferred audio and subtitle languages, leaving the key as it is.
+    pub fn save_languages(
+        &self,
+        audio: Option<&str>,
+        subtitle: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.lock().execute(
+            "INSERT INTO account_settings
+                 (account_id, audio_lang, subtitle_lang, updated_at, dirty)
+             VALUES (?1, ?2, ?3, ?4, 1)
+             ON CONFLICT (account_id) DO UPDATE SET
+                 audio_lang = excluded.audio_lang,
+                 subtitle_lang = excluded.subtitle_lang,
+                 updated_at = excluded.updated_at,
+                 dirty = 1",
+            params![LOCAL_ACCOUNT, audio, subtitle, now_millis()],
         )?;
         Ok(())
     }
@@ -224,5 +292,32 @@ mod tests {
             .unwrap();
         assert_eq!(version, MIGRATIONS.len() as i64);
         assert_eq!(store.list_addons().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn settings_start_unset_and_each_save_keeps_the_other_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.load_settings().unwrap(), Settings::default());
+
+        store.save_languages(Some("eng"), Some("fre")).unwrap();
+        store.save_real_debrid_key(Some("KEY")).unwrap();
+        store.save_languages(Some("jpn"), None).unwrap();
+
+        let reopened = Store::open(dir.path()).unwrap();
+        let expected = Settings {
+            real_debrid_key: Some("KEY".into()),
+            audio_lang: Some("jpn".into()),
+            subtitle_lang: None,
+        };
+        assert_eq!(reopened.load_settings().unwrap(), expected);
+        let dirty: i64 = reopened
+            .lock()
+            .query_row("SELECT dirty FROM account_settings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(dirty, 1);
+
+        reopened.save_real_debrid_key(None).unwrap();
+        assert_eq!(reopened.load_settings().unwrap().real_debrid_key, None);
     }
 }

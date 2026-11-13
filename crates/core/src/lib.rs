@@ -5,6 +5,7 @@ pub mod addon;
 mod app;
 mod playback;
 mod posters;
+pub mod settings;
 mod store;
 
 use std::path::PathBuf;
@@ -15,6 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use addon::types::{Meta, MetaPreview, Video};
 pub use posters::Poster;
+pub use settings::Settings;
 
 /// Installed on first launch.
 const CINEMETA_URL: &str = "https://v3-cinemeta.strem.io/manifest.json";
@@ -22,6 +24,10 @@ const CINEMETA_URL: &str = "https://v3-cinemeta.strem.io/manifest.json";
 /// A request from the UI.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
+    /// Installs an **addon** from its manifest URL. The URL may hold the `{real_debrid_key}`
+    /// placeholder; with no key saved, such an **addon** is listed but skipped, and its
+    /// manifest is fetched once a key is saved. A pasted URL that holds the saved key is stored
+    /// with the placeholder in its place.
     InstallAddon {
         url: String,
     },
@@ -72,6 +78,15 @@ pub enum Command {
     StopPlayback,
     /// What the player says about itself. Only the player sends this.
     ReportPlayback(PlaybackReport),
+    /// Saves the Real-Debrid key; `None` or a blank key clears it. A changed key clears or sets
+    /// [`InstalledAddon::skipped_reason`], fetches again the manifests of the **addons** whose
+    /// URL has the placeholder, and reloads the home screen.
+    SetRealDebridKey(Option<String>),
+    /// Saves the languages the player prefers, as ISO 639-2 codes such as `eng`.
+    SetPlaybackLanguages {
+        audio: Option<String>,
+        subtitle: Option<String>,
+    },
 }
 
 /// Everything the UI draws. Replaced as a whole after every change.
@@ -87,6 +102,8 @@ pub struct State {
     pub details: Option<Details>,
     /// The stream being played, until it ends or the person stops it.
     pub playback: Option<Playback>,
+    /// As saved. All unset until they are loaded at startup.
+    pub settings: Settings,
 }
 
 /// A title the person opened, and what its **addon** said about it.
@@ -240,11 +257,17 @@ pub struct Search {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledAddon {
+    /// As stored: may hold the `{real_debrid_key}` placeholder, never the key itself.
     pub url: String,
+    /// The fields below come from the manifest. While it has not been fetched yet, `id`,
+    /// `version` and `description` are empty and `name` is the URL's host.
     pub id: String,
     pub name: String,
     pub version: String,
     pub description: String,
+    /// Why the **addon** is left out of every request, for the person using the app. Set when
+    /// its URL has the placeholder and no Real-Debrid key is saved.
+    pub skipped_reason: Option<String>,
 }
 
 /// A message for the person using the app, such as why an install failed.

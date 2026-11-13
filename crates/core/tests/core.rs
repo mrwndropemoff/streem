@@ -2071,3 +2071,244 @@ async fn an_addon_without_subtitles_for_this_id_is_not_asked() {
 
     assert_eq!(subtitles_requests(&server).await, 0);
 }
+
+// ---- Real-Debrid key placeholder ------------------------------------------------------------
+
+use streem_core::Settings;
+
+const KEY: &str = "RDKEY123";
+const SKIPPED: &str = "Needs a Real-Debrid key. Add one in Settings.";
+
+/// The install URL of the **addon** served by [`serve_debrid_addon`], with the placeholder.
+fn debrid_template(server: &MockServer) -> String {
+    format!(
+        "{}/realdebrid={{real_debrid_key}}/manifest.json",
+        server.uri()
+    )
+}
+
+/// A Torrentio-like **addon** named "Debrid" that answers only under `/realdebrid={key}/`:
+/// its manifest, a catalog, and streams for `tt1`.
+async fn serve_debrid_addon(server: &MockServer, key: &str) {
+    let base = format!("/realdebrid={key}");
+    let manifest = r#"{"id": "org.example.debrid", "version": "1.0.0", "name": "Debrid",
+        "types": ["movie"], "resources": ["catalog", "stream"], "idPrefixes": ["tt"],
+        "catalogs": [{"type": "movie", "id": "top"}]}"#;
+    serve_json(server, &format!("{base}/manifest.json"), 200, manifest).await;
+    let catalog = r#"{"metas": [{"id": "tt1", "type": "movie", "name": "A Film"}]}"#;
+    serve_json(
+        server,
+        &format!("{base}/catalog/movie/top.json"),
+        200,
+        catalog,
+    )
+    .await;
+    let streams = r#"{"streams": [{"name": "RD", "url": "https://cdn.example/Film.mkv"}]}"#;
+    serve_json(
+        server,
+        &format!("{base}/stream/movie/tt1.json"),
+        200,
+        streams,
+    )
+    .await;
+}
+
+async fn request_paths(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|request| request.url.path().to_string())
+        .collect()
+}
+
+async fn set_key(core: &Core, key: Option<&str>) {
+    core.send(Command::SetRealDebridKey(key.map(str::to_string)));
+    wait_for(core, "key saved", |s| s.settings.key() == key).await;
+}
+
+fn debrid_ready(state: &State) -> bool {
+    state
+        .addons
+        .iter()
+        .any(|addon| addon.name == "Debrid" && addon.skipped_reason.is_none())
+}
+
+#[tokio::test]
+async fn a_templated_addon_is_requested_at_the_path_with_the_key() {
+    let server = MockServer::start().await;
+    serve_debrid_addon(&server, KEY).await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    set_key(&core, Some(KEY)).await;
+
+    core.send(Command::InstallAddon {
+        url: debrid_template(&server),
+    });
+    let state = wait_for(&core, "installed with its row", |s| {
+        debrid_ready(s) && rows_settled(s, 1)
+    })
+    .await;
+
+    assert_eq!(state.addons[0].url, debrid_template(&server));
+    assert!(matches!(&state.home[0].items, Load::Ready(items) if items.len() == 1));
+    let paths = request_paths(&server).await;
+    assert!(paths.contains(&format!("/realdebrid={KEY}/manifest.json")));
+    assert!(paths.contains(&format!("/realdebrid={KEY}/catalog/movie/top.json")));
+}
+
+#[tokio::test]
+async fn with_no_key_a_templated_addon_is_listed_skipped_and_never_asked() {
+    let server = MockServer::start().await;
+    serve_debrid_addon(&server, KEY).await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+
+    core.send(Command::InstallAddon {
+        url: debrid_template(&server),
+    });
+    let state = wait_for(&core, "listed and skipped", |s| s.addons.len() == 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(state.addons[0].url, debrid_template(&server));
+    assert_eq!(state.addons[0].skipped_reason.as_deref(), Some(SKIPPED));
+    assert!(core.state().home.is_empty());
+    assert_eq!(request_paths(&server).await, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn saving_a_key_clears_skipped_reason_and_fetches_the_manifest() {
+    let server = MockServer::start().await;
+    serve_debrid_addon(&server, KEY).await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    core.send(Command::InstallAddon {
+        url: debrid_template(&server),
+    });
+    wait_for(&core, "listed", |s| s.addons.len() == 1).await;
+
+    set_key(&core, Some(KEY)).await;
+    let state = wait_for(&core, "manifest fetched and home reloaded", |s| {
+        debrid_ready(s) && rows_settled(s, 1)
+    })
+    .await;
+
+    assert_eq!(state.addons[0].id, "org.example.debrid");
+    assert_eq!(state.addons[0].url, debrid_template(&server));
+    let paths = request_paths(&server).await;
+    assert!(paths.contains(&format!("/realdebrid={KEY}/manifest.json")));
+}
+
+#[tokio::test]
+async fn clearing_the_key_skips_the_templated_addon_and_leaves_the_others_working() {
+    let server = MockServer::start().await;
+    serve_debrid_addon(&server, KEY).await;
+    let plain = serve_addon(&server, "plain", r#"[{"type": "movie", "id": "top"}]"#).await;
+    serve_json(
+        &server,
+        "/plain/catalog/movie/top.json",
+        200,
+        r#"{"metas": []}"#,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    set_key(&core, Some(KEY)).await;
+    install(&core, plain, 1).await;
+    core.send(Command::InstallAddon {
+        url: debrid_template(&server),
+    });
+    wait_for(&core, "two rows", |s| debrid_ready(s) && rows_settled(s, 2)).await;
+    let asked_before = request_paths(&server).await.len();
+
+    set_key(&core, None).await;
+    let state = wait_for(&core, "debrid skipped, one row", |s| {
+        s.addons.iter().any(|a| a.skipped_reason.is_some()) && rows_settled(s, 1)
+    })
+    .await;
+
+    assert_eq!(state.addons.len(), 2, "a skipped addon stays in the list");
+    let debrid = state.addons.iter().find(|a| a.name == "Debrid").unwrap();
+    assert_eq!(debrid.skipped_reason.as_deref(), Some(SKIPPED));
+    assert_eq!(state.home[0].addon_name, "plain");
+
+    // Neither the reloaded home screen nor a stream request goes to the skipped addon.
+    let meta = serve_meta_addon(&server, "meta", r#""meta""#).await;
+    serve_json(
+        &server,
+        "/meta/meta/movie/tt1.json",
+        200,
+        r#"{"meta": {"id": "tt1", "type": "movie", "name": "A Film"}}"#,
+    )
+    .await;
+    install(&core, meta, 3).await;
+    open_title(&core, "movie", "tt1").await;
+    let list = load_streams(&core, "tt1").await;
+    assert!(list.groups.is_empty(), "{list:?}");
+    let asked_debrid_after = request_paths(&server).await[asked_before..]
+        .iter()
+        .filter(|path| path.starts_with("/realdebrid="))
+        .count();
+    assert_eq!(asked_debrid_after, 0);
+}
+
+#[tokio::test]
+async fn installing_a_url_holding_the_saved_key_stores_the_placeholder() {
+    let server = MockServer::start().await;
+    serve_debrid_addon(&server, KEY).await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    set_key(&core, Some(KEY)).await;
+
+    core.send(Command::InstallAddon {
+        url: format!("{}/realdebrid={KEY}/manifest.json", server.uri()),
+    });
+    let state = wait_for(&core, "installed", debrid_ready).await;
+
+    assert_eq!(state.addons[0].url, debrid_template(&server));
+}
+
+#[tokio::test]
+async fn a_blank_key_clears_the_saved_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = start(dir.path());
+    set_key(&core, Some(KEY)).await;
+
+    core.send(Command::SetRealDebridKey(Some("   ".into())));
+    let state = wait_for(&core, "key cleared", |s| s.settings.key().is_none()).await;
+    assert_eq!(state.settings.real_debrid_key, None);
+}
+
+#[tokio::test]
+async fn settings_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let expected = Settings {
+        real_debrid_key: Some(KEY.into()),
+        audio_lang: Some("jpn".into()),
+        subtitle_lang: Some("eng".into()),
+    };
+    {
+        let core = start(dir.path());
+        core.send(Command::SetRealDebridKey(Some(format!(" {KEY} "))));
+        core.send(Command::SetPlaybackLanguages {
+            audio: Some("jpn".into()),
+            subtitle: Some("eng".into()),
+        });
+        wait_for(&core, "settings saved", |s| s.settings == expected).await;
+    }
+
+    let core = start(dir.path());
+    wait_for(&core, "settings loaded", |s| s.settings == expected).await;
+
+    core.send(Command::SetPlaybackLanguages {
+        audio: Some("eng".into()),
+        subtitle: None,
+    });
+    let state = wait_for(&core, "subtitles off", |s| {
+        s.settings.subtitle_lang.is_none()
+    })
+    .await;
+    assert_eq!(state.settings.real_debrid_key.as_deref(), Some(KEY));
+    assert_eq!(state.settings.audio_lang.as_deref(), Some("eng"));
+}
