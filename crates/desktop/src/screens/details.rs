@@ -3,7 +3,8 @@
 //!
 //! Everything here is drawing. The title comes from `State.details`; pictures come from
 //! `Core::poster`. Streams are asked for with `Command::LoadStreams`: for a movie as soon as
-//! its details are ready, for a series when an episode is clicked.
+//! its details are ready, for a series when an episode is clicked. The library button sends
+//! `Command::AddToLibrary` or `Command::RemoveFromLibrary` according to `Details::in_library`.
 
 use eframe::egui;
 use streem_core::{Command, Core, Details, Load, Meta, State, StreamItem, StreamList, Video};
@@ -87,6 +88,7 @@ impl DetailsScreen {
             self.poster(ui, meta, core);
             ui.vertical(|ui| {
                 ui.heading(&meta.name);
+                library_button(ui, details, core);
                 let facts: Vec<&str> = [meta.release_info.as_deref(), meta.rating.as_deref()]
                     .into_iter()
                     .flatten()
@@ -219,6 +221,19 @@ impl DetailsScreen {
             }
         }
         clicked
+    }
+}
+
+/// "Add to library", or "Remove from library" once the title is in it.
+fn library_button(ui: &mut egui::Ui, details: &Details, core: &Core) {
+    if details.in_library {
+        if ui.button("Remove from library").clicked() {
+            core.send(Command::RemoveFromLibrary {
+                meta_id: details.meta_id.clone(),
+            });
+        }
+    } else if ui.button("Add to library").clicked() {
+        core.send(Command::AddToLibrary);
     }
 }
 

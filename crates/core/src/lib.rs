@@ -3,6 +3,7 @@
 
 pub mod addon;
 mod app;
+mod library;
 mod playback;
 mod posters;
 mod store;
@@ -72,6 +73,13 @@ pub enum Command {
     StopPlayback,
     /// What the player says about itself. Only the player sends this.
     ReportPlayback(PlaybackReport),
+    /// Adds the title in [`State::details`] to the library, or moves it to the front if it is
+    /// already there. Ignored unless its details are ready.
+    AddToLibrary,
+    /// Takes a title out of the library. Ignored when it is not there.
+    RemoveFromLibrary {
+        meta_id: String,
+    },
 }
 
 /// Everything the UI draws. Replaced as a whole after every change.
@@ -87,6 +95,18 @@ pub struct State {
     pub details: Option<Details>,
     /// The stream being played, until it ends or the person stops it.
     pub playback: Option<Playback>,
+    /// The titles in the library, most recently added first. Empty until it is loaded from
+    /// local storage at startup.
+    pub library: Vec<LibraryItem>,
+}
+
+/// A title in the library: enough to draw its poster and open its details again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryItem {
+    pub meta_type: String,
+    pub meta_id: String,
+    pub name: String,
+    pub poster: Option<String>,
 }
 
 /// A title the person opened, and what its **addon** said about it.
@@ -97,6 +117,8 @@ pub struct Details {
     pub meta: Load<Meta>,
     /// The streams of the video last asked for with [`Command::LoadStreams`].
     pub streams: Option<StreamList>,
+    /// The title is in [`State::library`].
+    pub in_library: bool,
 }
 
 /// The streams of one video, grouped by the **addon** that supplied them, in **addon** order.

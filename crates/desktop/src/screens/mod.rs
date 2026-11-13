@@ -1,6 +1,7 @@
 pub mod addons;
 pub mod details;
 pub mod home;
+pub mod library;
 pub mod player;
 pub mod search;
 
@@ -106,7 +107,7 @@ pub fn catalog_row(
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         for item in items {
-                            if poster(ui, item, textures, core) {
+                            if poster(ui, &item.name, item.poster.as_deref(), textures, core) {
                                 opened = Some(item.clone());
                             }
                         }
@@ -117,8 +118,14 @@ pub fn catalog_row(
     opened
 }
 
-/// Draws one poster. Returns true when it was clicked.
-fn poster(ui: &mut egui::Ui, item: &MetaPreview, textures: &mut Textures, core: &Core) -> bool {
+/// Draws one poster with the title's name below it. Returns true when it was clicked.
+fn poster(
+    ui: &mut egui::Ui,
+    name: &str,
+    poster_url: Option<&str>,
+    textures: &mut Textures,
+    core: &Core,
+) -> bool {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(POSTER_WIDTH, POSTER_HEIGHT + NAME_HEIGHT),
         egui::Sense::click(),
@@ -129,10 +136,7 @@ fn poster(ui: &mut egui::Ui, item: &MetaPreview, textures: &mut Textures, core: 
     }
     let picture_rect = poster_rect(rect);
 
-    let texture = item
-        .poster
-        .as_deref()
-        .and_then(|url| textures.get(ui.ctx(), core, url));
+    let texture = poster_url.and_then(|url| textures.get(ui.ctx(), core, url));
     match texture {
         Some(texture) => {
             egui::Image::new(&texture)
@@ -145,7 +149,7 @@ fn poster(ui: &mut egui::Ui, item: &MetaPreview, textures: &mut Textures, core: 
 
     let text_color = ui.visuals().text_color();
     let font = egui::TextStyle::Body.resolve(ui.style());
-    let mut job = egui::text::LayoutJob::simple_singleline(item.name.clone(), font, text_color);
+    let mut job = egui::text::LayoutJob::simple_singleline(name.to_string(), font, text_color);
     job.wrap = egui::text::TextWrapping {
         max_width: POSTER_WIDTH,
         max_rows: 1,

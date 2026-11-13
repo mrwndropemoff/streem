@@ -18,12 +18,13 @@ use crate::addon::client::{
 use crate::addon::types::{
     Manifest, ManifestCatalog, Meta, MetaPreview, Stream, StreamSource, is_http,
 };
+use crate::library;
 use crate::playback::{self, Links, Reported};
 use crate::posters::{self, Poster, PosterCache};
 use crate::store::{Store, StoreError, StoredAddon};
 use crate::{
-    CatalogRow, Command, Details, InstalledAddon, Load, Notice, Playback, Search, State,
-    StreamGroup, StreamItem, StreamList, SubtitleTrack,
+    CatalogRow, Command, Details, InstalledAddon, LibraryItem, Load, Notice, Playback, Search,
+    State, StreamGroup, StreamItem, StreamList, SubtitleTrack,
 };
 
 /// Position-only reports from the player are published at most this often.
@@ -82,8 +83,16 @@ pub(crate) enum RowList {
     Search,
 }
 
+/// What a disk job read back after its write.
+pub(crate) enum StoreOutput {
+    /// After loading at startup, installing or removing an **addon**.
+    Addons(AddonList),
+    /// After loading at startup, adding to or removing from the library.
+    Library(Vec<LibraryItem>),
+}
+
 /// The **addon** list as saved, after a disk job.
-pub(crate) struct StoreOutput {
+pub(crate) struct AddonList {
     addons: Vec<InstalledAddon>,
     /// The catalogs the home screen can show, from the saved manifests.
     catalogs: Vec<CatalogSource>,
@@ -108,6 +117,13 @@ enum StoreJob {
     Load,
     Upsert { url: String, manifest_json: String },
     Remove { url: String },
+    Library(LibraryJob),
+}
+
+enum LibraryJob {
+    Load,
+    Add(LibraryItem),
+    Remove { meta_id: String },
 }
 
 pub(crate) struct App {
@@ -130,6 +146,7 @@ impl App {
             self.sender.clone(),
         ));
         let _ = jobs.send(StoreJob::Load);
+        let _ = jobs.send(StoreJob::Library(LibraryJob::Load));
 
         let client = http_client();
         let mut state = State::default();
@@ -247,7 +264,9 @@ impl App {
                         meta_id,
                         meta,
                         streams: None,
+                        in_library: false,
                     });
+                    library::mark_details(&mut state);
                 }
                 Message::Command(Command::CloseTitle) => {
                     details_generation += 1;
@@ -366,6 +385,13 @@ impl App {
                     let _ = jobs.send(StoreJob::Remove { url });
                 }
                 Message::Command(Command::DismissNotice) => state.notice = None,
+                Message::Command(
+                    command @ (Command::AddToLibrary | Command::RemoveFromLibrary { .. }),
+                ) => {
+                    if let Some(job) = library_job(&state, command) {
+                        let _ = jobs.send(job);
+                    }
+                }
                 Message::Fetched(id, result) => {
                     // Not in the map: the **addon** was removed while it was downloading.
                     if let Some(url) = downloading.remove(&id) {
@@ -379,9 +405,12 @@ impl App {
                         }
                     }
                 }
-                Message::Stored(Ok(output)) => {
+                Message::Stored(Ok(StoreOutput::Library(items))) => {
+                    library::replace(&mut state, items);
+                }
+                Message::Stored(Ok(StoreOutput::Addons(output))) => {
                     state.addons = output.addons;
-                    // Every finished disk job is a startup load, an install or a removal.
+                    // Every **addon** job is a startup load, an install or a removal.
                     catalogs = output.catalogs;
                     search_catalogs = output.search_catalogs;
                     manifests = output.manifests;
@@ -435,11 +464,18 @@ impl App {
             }
         }
 
-        // Shutting down. Keep what the person already asked for: removals and downloaded
-        // manifests still waiting in the inbox become disk jobs, then wait for the disk
-        // worker to finish every queued job. Downloads still in progress are given up.
+        // Shutting down. Keep what the person already asked for: removals, library changes and
+        // downloaded manifests still waiting in the inbox become disk jobs, then wait for the
+        // disk worker to finish every queued job. Downloads still in progress are given up.
         while let Ok(message) = self.inbox.try_recv() {
             match message {
+                Message::Command(
+                    command @ (Command::AddToLibrary | Command::RemoveFromLibrary { .. }),
+                ) => {
+                    if let Some(job) = library_job(&state, command) {
+                        let _ = jobs.send(job);
+                    }
+                }
                 Message::Command(Command::RemoveAddon { url }) => {
                     downloading.retain(|_, downloading_url| *downloading_url != url);
                     let _ = jobs.send(StoreJob::Remove { url });
@@ -455,6 +491,17 @@ impl App {
         drop(jobs);
         let _ = worker.await;
     }
+}
+
+/// The disk job for a library command, or `None` when it is ignored: adding with no ready
+/// details. Shared by the main loop and the shutdown drain, so both ignore the same commands.
+fn library_job(state: &State, command: Command) -> Option<StoreJob> {
+    let job = match command {
+        Command::AddToLibrary => LibraryJob::Add(library::item_to_add(state)?),
+        Command::RemoveFromLibrary { meta_id } => LibraryJob::Remove { meta_id },
+        _ => return None,
+    };
+    Some(StoreJob::Library(job))
 }
 
 fn notice(next_id: &mut u64, text: String) -> Notice {
@@ -716,12 +763,23 @@ async fn store_worker(
     }
 }
 
+/// Writes the library change, if any, then reads the whole library back.
+fn run_library_job(store: &Store, job: LibraryJob) -> Result<StoreOutput, StoreError> {
+    match job {
+        LibraryJob::Load => {}
+        LibraryJob::Add(item) => store.add_to_library(&item)?,
+        LibraryJob::Remove { meta_id } => store.remove_from_library(&meta_id)?,
+    }
+    Ok(StoreOutput::Library(store.list_library()?))
+}
+
 fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
     let mut first_launch = false;
     match job {
         StoreJob::Load => first_launch = store.has_no_addon_rows()?,
         StoreJob::Upsert { url, manifest_json } => store.upsert_addon(&url, &manifest_json)?,
         StoreJob::Remove { url } => store.remove_addon(&url)?,
+        StoreJob::Library(job) => return run_library_job(store, job),
     }
     let mut addons = Vec::new();
     let mut catalogs = Vec::new();
@@ -747,13 +805,13 @@ fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
         manifests.push((addon.url.clone(), manifest));
         addons.push(addon);
     }
-    Ok(StoreOutput {
+    Ok(StoreOutput::Addons(AddonList {
         addons,
         catalogs,
         search_catalogs,
         manifests,
         first_launch,
-    })
+    }))
 }
 
 /// A saved row whose manifest can no longer be read is left out of the list.
