@@ -307,6 +307,39 @@ async fn a_rejected_refresh_token_gives_signed_out() {
 }
 
 #[tokio::test]
+async fn a_refresh_answered_with_a_retry_later_status_stays_signed_in() {
+    for status in [408, 425, 429, 404] {
+        let server = supabase().await;
+        let dir = signed_in_before(&server).await;
+        let busy = MockServer::start().await;
+        auth_mock("/auth/v1/token")
+            .and(query_param("grant_type", "refresh_token"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&busy)
+            .await;
+
+        let core = start(dir.path(), backend(&busy));
+        wait_for(&core, "signed in", signed_in).await;
+        for _ in 0..250 {
+            if refresh_requests(&busy).await > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(refresh_requests(&busy).await > 0, "{status}: never tried");
+        // Time for the answer to reach `Core`.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            signed_in(&core.state()),
+            "{status}: {:?}",
+            core.state().session
+        );
+        assert!(dir.path().join("session.json").exists(), "{status}");
+    }
+}
+
+#[tokio::test]
 async fn a_refresh_that_cannot_connect_stays_signed_in() {
     let server = supabase().await;
     let dir = signed_in_before(&server).await;

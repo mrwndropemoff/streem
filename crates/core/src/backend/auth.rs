@@ -214,9 +214,16 @@ impl Auth {
             .await
             .map_err(|_| TokenError::Unavailable)?;
         let status = response.status();
-        // A 4xx other than "too many requests" is the server refusing this refresh token.
-        // A paused project or a server error must not sign anyone out.
-        if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        // Only these answers mean the server refuses this refresh token: Supabase Auth answers
+        // 400 for an unknown or already used one, and 401 or 403 for a session it ended. Any other
+        // answer (408 and 429 are retry-later, a paused project or a server error is not about
+        // this token) must not sign anyone out.
+        if matches!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST
+                | reqwest::StatusCode::UNAUTHORIZED
+                | reqwest::StatusCode::FORBIDDEN
+        ) {
             *guard = None;
             self.delete().await;
             return Err(TokenError::Rejected);
