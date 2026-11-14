@@ -3,6 +3,7 @@
 
 pub mod addon;
 mod app;
+mod backend;
 mod library;
 mod playback;
 mod posters;
@@ -16,6 +17,7 @@ use std::thread::JoinHandle;
 use tokio::sync::{mpsc, oneshot};
 
 pub use addon::types::{Meta, MetaPreview, Video};
+pub use backend::BackendConfig;
 pub use posters::Poster;
 pub use settings::Settings;
 
@@ -96,9 +98,24 @@ pub enum Command {
         audio: Option<String>,
         subtitle: Option<String>,
     },
+    /// Creates an **account** and signs in to it. Ignored unless [`State::session`] is
+    /// [`Session::SignedOut`].
+    SignUp {
+        email: String,
+        password: String,
+    },
+    /// Signs in to an existing **account**. Ignored unless [`State::session`] is
+    /// [`Session::SignedOut`].
+    SignIn {
+        email: String,
+        password: String,
+    },
+    /// Signs this device out. Ignored unless [`State::session`] is [`Session::SignedIn`].
+    SignOut,
 }
 
-// By hand, so that no `{:?}` of a command, in a log or a failed test, can print the key.
+// By hand, so that no `{:?}` of a command, in a log or a failed test, can print the key or a
+// password.
 impl std::fmt::Debug for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let hidden = |set: bool| if set { "<hidden>" } else { "None" };
@@ -155,13 +172,46 @@ impl std::fmt::Debug for Command {
                 .field("audio", audio)
                 .field("subtitle", subtitle)
                 .finish(),
+            Command::SignUp { email, .. } => f
+                .debug_struct("SignUp")
+                .field("email", email)
+                .field("password", &format_args!("<hidden>"))
+                .finish(),
+            Command::SignIn { email, .. } => f
+                .debug_struct("SignIn")
+                .field("email", email)
+                .field("password", &format_args!("<hidden>"))
+                .finish(),
+            Command::SignOut => f.write_str("SignOut"),
         }
     }
+}
+
+/// Whether someone is signed in to an **account** on this device.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Session {
+    /// The app was built without the sync backend's address. No one can sign in; the data
+    /// stored on this device is used as it is.
+    #[default]
+    NotConfigured,
+    /// No one is signed in. `error` is text for the person: why the last attempt failed, or
+    /// why they were signed out.
+    SignedOut {
+        error: Option<String>,
+    },
+    /// Waiting for the server: at startup, or while signing in, up or out.
+    Working,
+    SignedIn {
+        email: String,
+    },
 }
 
 /// Everything the UI draws. Replaced as a whole after every change.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct State {
+    /// Whether someone is signed in. With a sync backend, everything below stays empty until
+    /// someone is, and is emptied again when they sign out.
+    pub session: Session,
     pub addons: Vec<InstalledAddon>,
     pub notice: Option<Notice>,
     /// One row for each catalog the installed **addons** offer, in **addon** order.
@@ -374,25 +424,59 @@ pub struct Core {
 impl Core {
     /// Starts the background runtime. `on_change` is called after every state change.
     pub fn start(data_dir: PathBuf, on_change: impl Fn() + Send + Sync + 'static) -> Core {
-        Core::start_with_defaults(data_dir, on_change, vec![CINEMETA_URL.to_string()])
+        Core::start_with_backend(data_dir, BackendConfig::from_build(), on_change)
     }
 
-    /// Like [`Core::start`], but names the **addons** to install on first launch
-    /// (when the data directory has no **addon** rows at all). Tests use it to stay offline.
+    /// Like [`Core::start`], with the sync backend given rather than read from the build.
+    /// With `None` the session is [`Session::NotConfigured`].
+    pub fn start_with_backend(
+        data_dir: PathBuf,
+        backend: Option<BackendConfig>,
+        on_change: impl Fn() + Send + Sync + 'static,
+    ) -> Core {
+        let defaults = vec![CINEMETA_URL.to_string()];
+        Core::start_with_options(data_dir, backend, on_change, defaults)
+    }
+
+    /// Like [`Core::start`] with no sync backend, but names the **addons** to install on first
+    /// launch (when the data directory has no **addon** rows at all). Tests use it to stay
+    /// offline.
     pub fn start_with_defaults(
         data_dir: PathBuf,
         on_change: impl Fn() + Send + Sync + 'static,
         default_addon_urls: Vec<String>,
     ) -> Core {
-        let state = Arc::new(RwLock::new(Arc::new(State::default())));
+        Core::start_with_options(data_dir, None, on_change, default_addon_urls)
+    }
+
+    /// Takes both the sync backend and the **addons** to install when an **account** has none.
+    /// With a backend, that install happens after sign-in. Tests use it to stay offline.
+    pub fn start_with_options(
+        data_dir: PathBuf,
+        backend: Option<BackendConfig>,
+        on_change: impl Fn() + Send + Sync + 'static,
+        default_addon_urls: Vec<String>,
+    ) -> Core {
+        // Set before the thread starts, so the UI never draws a moment of the wrong screen.
+        let session = match backend {
+            Some(_) => Session::Working,
+            None => Session::NotConfigured,
+        };
+        let initial = State {
+            session,
+            ..State::default()
+        };
+        let state = Arc::new(RwLock::new(Arc::new(initial.clone())));
         let (commands, inbox) = mpsc::unbounded_channel();
         let (shutdown, shutdown_signal) = oneshot::channel();
         let posters = Arc::new(posters::PosterCache::default());
 
         let app = app::App {
             data_dir,
+            backend,
             on_change: Arc::new(on_change),
             default_addon_urls,
+            initial,
             state: state.clone(),
             posters: posters.clone(),
             sender: commands.clone(),

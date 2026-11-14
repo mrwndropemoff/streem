@@ -12,7 +12,8 @@ use crate::settings::Settings;
 
 use crate::LibraryItem;
 
-/// Until sign-in exists, every row belongs to this **account**.
+/// The **account** rows belong to while the sync backend is not configured, and that rows
+/// written before sign-in existed belong to.
 pub const LOCAL_ACCOUNT: &str = "local";
 /// Until **profiles** exist, every library row belongs to this **profile**.
 pub const LOCAL_PROFILE: &str = "local";
@@ -54,7 +55,15 @@ const MIGRATIONS: &[&str] = &[
         updated_at      INTEGER,
         dirty           INTEGER
     )",
+    // 4: facts about this device's copy, such as which **account** its rows belong to.
+    "CREATE TABLE local_state (
+        key   TEXT PRIMARY KEY,
+        value TEXT
+    )",
 ];
+
+/// The tables holding an **account**'s data, emptied when another **account** signs in.
+const DATA_TABLES: &[&str] = &["addons", "library_items", "account_settings"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -76,6 +85,9 @@ pub struct StoredAddon {
 #[derive(Clone)]
 pub struct Store {
     connection: Arc<Mutex<Connection>>,
+    /// The **account** every row is read and written for: [`LOCAL_ACCOUNT`] until
+    /// [`Store::switch_account`] is called.
+    account_id: Arc<Mutex<String>>,
 }
 
 impl Store {
@@ -86,7 +98,49 @@ impl Store {
         migrate(&mut connection)?;
         Ok(Store {
             connection: Arc::new(Mutex::new(connection)),
+            account_id: Arc::new(Mutex::new(LOCAL_ACCOUNT.to_string())),
         })
+    }
+
+    /// Makes `account_id` the **account** every later read and write is for. When the rows
+    /// stored here belong to another **account**, or to none (development data from before
+    /// sign-in existed), every row of every data table is deleted first. Returns whether rows
+    /// were deleted.
+    pub fn switch_account(&self, account_id: &str) -> Result<bool, StoreError> {
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        let stored: Option<String> = transaction
+            .query_row(
+                "SELECT value FROM local_state WHERE key = 'account_id'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let other = stored.as_deref() != Some(account_id);
+        if other {
+            for table in DATA_TABLES {
+                transaction.execute(&format!("DELETE FROM {table}"), [])?;
+            }
+            transaction.execute(
+                "INSERT INTO local_state (key, value) VALUES ('account_id', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                params![account_id],
+            )?;
+        }
+        transaction.commit()?;
+        *self
+            .account_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = account_id.to_string();
+        Ok(other)
+    }
+
+    fn account_id(&self) -> String {
+        self.account_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
@@ -110,7 +164,7 @@ impl Store {
             "SELECT url, manifest_json FROM addons
              WHERE account_id = ?1 AND deleted = 0 ORDER BY position, url",
         )?;
-        let rows = statement.query_map(params![LOCAL_ACCOUNT], |row| {
+        let rows = statement.query_map(params![self.account_id()], |row| {
             Ok(StoredAddon {
                 url: row.get(0)?,
                 manifest_json: row.get(1)?,
@@ -137,7 +191,7 @@ impl Store {
                  updated_at = excluded.updated_at,
                  deleted = 0,
                  dirty = 1",
-            params![LOCAL_ACCOUNT, url, manifest_json, now_millis()],
+            params![self.account_id(), url, manifest_json, now_millis()],
         )?;
         Ok(())
     }
@@ -149,7 +203,7 @@ impl Store {
             .query_row(
                 "SELECT real_debrid_key, audio_lang, subtitle_lang FROM account_settings
                  WHERE account_id = ?1",
-                params![LOCAL_ACCOUNT],
+                params![self.account_id()],
                 |row| {
                     Ok(Settings {
                         real_debrid_key: row.get(0)?,
@@ -171,7 +225,7 @@ impl Store {
                  real_debrid_key = excluded.real_debrid_key,
                  updated_at = excluded.updated_at,
                  dirty = 1",
-            params![LOCAL_ACCOUNT, key, now_millis()],
+            params![self.account_id(), key, now_millis()],
         )?;
         Ok(())
     }
@@ -191,7 +245,7 @@ impl Store {
                  subtitle_lang = excluded.subtitle_lang,
                  updated_at = excluded.updated_at,
                  dirty = 1",
-            params![LOCAL_ACCOUNT, audio, subtitle, now_millis()],
+            params![self.account_id(), audio, subtitle, now_millis()],
         )?;
         Ok(())
     }
@@ -201,7 +255,7 @@ impl Store {
         self.lock().execute(
             "UPDATE addons SET deleted = 1, dirty = 1, updated_at = ?3
              WHERE account_id = ?1 AND url = ?2",
-            params![LOCAL_ACCOUNT, url, now_millis()],
+            params![self.account_id(), url, now_millis()],
         )?;
         Ok(())
     }
@@ -241,7 +295,7 @@ impl Store {
                  deleted = 0,
                  dirty = 1",
             params![
-                LOCAL_ACCOUNT,
+                self.account_id(),
                 LOCAL_PROFILE,
                 item.meta_id,
                 item.meta_type,
@@ -519,5 +573,81 @@ mod tests {
         assert_eq!(ids, ["tt1", "tt2"]);
         let (_, _, deleted, dirty, _) = library_row(&store, "tt1");
         assert_eq!((deleted, dirty), (0, 1));
+    }
+
+    fn count(store: &Store, table: &str) -> i64 {
+        store
+            .lock()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn the_first_account_empties_the_data_from_before_sign_in() {
+        let (_dir, store) = open();
+        store.upsert_addon("https://a/manifest.json", "{}").unwrap();
+        store.add_to_library(&film("tt1")).unwrap();
+        store.save_real_debrid_key(Some("KEY")).unwrap();
+
+        assert!(store.switch_account("user-a").unwrap());
+
+        for table in DATA_TABLES {
+            assert_eq!(count(&store, table), 0, "{table}");
+        }
+    }
+
+    #[test]
+    fn rows_are_written_and_read_for_the_signed_in_account() {
+        let (_dir, store) = open();
+        store.switch_account("user-a").unwrap();
+        store.upsert_addon("https://a/manifest.json", "{}").unwrap();
+        store.add_to_library(&film("tt1")).unwrap();
+        store.save_real_debrid_key(Some("KEY")).unwrap();
+
+        assert_eq!(store.list_addons().unwrap().len(), 1);
+        assert_eq!(store.load_settings().unwrap().key(), Some("KEY"));
+        let (account, profile, ..) = library_row(&store, "tt1");
+        assert_eq!((account.as_str(), profile.as_str()), ("user-a", "local"));
+        for table in DATA_TABLES {
+            let others: i64 = store
+                .lock()
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE account_id <> 'user-a'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(others, 0, "{table}");
+        }
+    }
+
+    #[test]
+    fn the_same_account_again_keeps_its_rows_even_after_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.switch_account("user-a").unwrap();
+        store.upsert_addon("https://a/manifest.json", "{}").unwrap();
+
+        let reopened = Store::open(dir.path()).unwrap();
+        assert!(!reopened.switch_account("user-a").unwrap());
+        assert_eq!(reopened.list_addons().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn another_account_empties_every_data_table() {
+        let (_dir, store) = open();
+        store.switch_account("user-a").unwrap();
+        store.upsert_addon("https://a/manifest.json", "{}").unwrap();
+        store.add_to_library(&film("tt1")).unwrap();
+        store.save_languages(Some("eng"), None).unwrap();
+
+        assert!(store.switch_account("user-b").unwrap());
+
+        for table in DATA_TABLES {
+            assert_eq!(count(&store, table), 0, "{table}");
+        }
+        assert!(store.has_no_addon_rows().unwrap());
     }
 }

@@ -7,7 +7,7 @@ mod screens;
 use std::path::PathBuf;
 
 use eframe::egui;
-use streem_core::{Command, Core, PlaybackReport, State};
+use streem_core::{Command, Core, PlaybackReport, Session, State};
 
 use mpv_view::MpvView;
 
@@ -38,6 +38,7 @@ struct App {
     details: screens::details::DetailsScreen,
     player: screens::player::PlayerScreen,
     settings: screens::settings::SettingsScreen,
+    sign_in: screens::sign_in::SignInScreen,
     /// `None` when libmpv could not start. Browsing still works; playing a stream then fails.
     video: Option<MpvView>,
     /// `State.playback` was set in the last frame, so the player screen was showing.
@@ -67,6 +68,7 @@ impl App {
             details: Default::default(),
             player: Default::default(),
             settings: Default::default(),
+            sign_in: Default::default(),
             video,
             was_playing: false,
         }
@@ -109,6 +111,18 @@ impl App {
         }
     }
 
+    /// The sign-in screen, shown in place of everything else while no one is signed in. The
+    /// core has already emptied the state; this puts the screens back to where the app starts.
+    fn show_sign_in(&mut self, ui: &mut egui::Ui, state: &State) {
+        self.after_playback(&ui.ctx().clone());
+        if self.screen == Screen::Details {
+            self.details.on_leave();
+        }
+        self.screen = Screen::Home;
+        self.search_text.clear();
+        egui::CentralPanel::default().show(ui, |ui| self.sign_in.ui(ui, state, &self.core));
+    }
+
     /// Leaves the details screen for `screen` and tells the core the title is closed.
     fn leave_details(&mut self, screen: Screen) {
         self.core.send(Command::CloseTitle);
@@ -140,6 +154,10 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let state = self.core.state();
+        if !matches!(state.session, Session::SignedIn { .. }) {
+            self.show_sign_in(ui, &state);
+            return;
+        }
         if state.playback.is_some() {
             self.show_player(ui, &state);
             return;

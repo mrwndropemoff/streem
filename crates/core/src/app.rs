@@ -19,6 +19,8 @@ use crate::addon::types::{
     Manifest, ManifestCatalog, Meta, MetaPreview, Stream, StreamSource, is_http,
 };
 use crate::addon::url::{has_placeholder, templatize};
+use crate::backend::BackendConfig;
+use crate::backend::auth::{self, Account, Auth, TokenError};
 use crate::library;
 use crate::playback::{self, Links, Reported};
 use crate::posters::{self, Poster, PosterCache};
@@ -26,11 +28,13 @@ use crate::settings::{self, Settings};
 use crate::store::{Store, StoreError, StoredAddon};
 use crate::{
     CatalogRow, Command, Details, InstalledAddon, LibraryItem, Load, Notice, Playback, Search,
-    State, StreamGroup, StreamItem, StreamList, SubtitleTrack,
+    Session, State, StreamGroup, StreamItem, StreamList, SubtitleTrack,
 };
 
 /// Position-only reports from the player are published at most this often.
 const POSITION_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
+/// How long to wait before trying a refresh again after the server could not be reached.
+const REFRESH_RETRY: Duration = Duration::from_secs(30);
 
 /// What the task receives: the UI's commands, and results of work it started.
 pub(crate) enum Message {
@@ -76,6 +80,28 @@ pub(crate) enum Message {
         generation: u64,
         tracks: Vec<SubtitleTrack>,
     },
+    /// The sync backend answered. Ignored when `generation` is not the latest one, which means
+    /// the person signed in, up or out since the request was made.
+    Auth {
+        generation: u64,
+        event: AuthEvent,
+    },
+}
+
+/// What came of a request to the sync backend's Auth API.
+pub(crate) enum AuthEvent {
+    /// Signed in or up, or, when `restored`, found in `session.json` at startup.
+    SignedIn {
+        account: Account,
+        restored: bool,
+    },
+    /// No `session.json` at startup.
+    NoSession,
+    /// Signing in or up failed. Text for the person.
+    Failed(String),
+    SignedOut,
+    /// A refresh of the access token finished.
+    Refreshed(Result<(), TokenError>),
 }
 
 /// Which rows a [`Message::Catalog`] belongs to.
@@ -95,6 +121,9 @@ pub(crate) enum StoreOutput {
     SettingsLoaded(Settings),
     /// After saving a setting. `State` already shows it.
     SettingsSaved,
+    /// Every later job reads and writes the rows of the **account** signed in. On an error
+    /// (text for the person) they still read and write the **account**'s before.
+    AccountSwitched(Result<(), String>),
 }
 
 /// The **addon** list as saved, after a disk job.
@@ -135,6 +164,11 @@ enum StoreJob {
     },
     Library(LibraryJob),
     Settings(SettingsJob),
+    /// Reads and writes this **account**'s rows from now on, after deleting every row of
+    /// another one.
+    SwitchAccount {
+        account_id: String,
+    },
 }
 
 enum LibraryJob {
@@ -154,8 +188,12 @@ enum SettingsJob {
 
 pub(crate) struct App {
     pub(crate) data_dir: PathBuf,
+    /// `None`: no one signs in, and the rows stored for no **account** are used.
+    pub(crate) backend: Option<BackendConfig>,
     pub(crate) on_change: Arc<dyn Fn() + Send + Sync>,
     pub(crate) default_addon_urls: Vec<String>,
+    /// The state already published when the task starts.
+    pub(crate) initial: State,
     pub(crate) state: Arc<RwLock<Arc<State>>>,
     pub(crate) posters: Arc<PosterCache>,
     pub(crate) sender: mpsc::UnboundedSender<Message>,
@@ -171,13 +209,33 @@ impl App {
             job_inbox,
             self.sender.clone(),
         ));
-        // Settings first, so the **addons** are listed knowing which ones need a key.
-        let _ = jobs.send(StoreJob::Settings(SettingsJob::Load));
-        let _ = jobs.send(StoreJob::Load);
-        let _ = jobs.send(StoreJob::Library(LibraryJob::Load));
-
         let client = http_client();
-        let mut state = State::default();
+        let auth = self
+            .backend
+            .take()
+            .map(|config| Arc::new(Auth::new(client.clone(), config, &self.data_dir)));
+        // Which sign-in, sign-up or sign-out the running Auth requests belong to.
+        let mut auth_generation = 0;
+        // **Account** switches queued on the disk worker and not finished yet. Until they are,
+        // what the worker reads back belongs to an **account** that is no longer signed in.
+        let mut switches_pending = 0;
+        match &auth {
+            None => load_account(&jobs),
+            Some(auth) => {
+                let auth = auth.clone();
+                spawn_auth(&self.sender, auth_generation, async move {
+                    match auth.restore().await {
+                        Some(account) => AuthEvent::SignedIn {
+                            account,
+                            restored: true,
+                        },
+                        None => AuthEvent::NoSession,
+                    }
+                });
+            }
+        }
+
+        let mut state = self.initial.clone();
         let mut published = Arc::new(state.clone());
         let mut next_notice_id = 1;
         // Installs still downloading, by id, with the **addon** URL. Removing it cancels them.
@@ -223,7 +281,26 @@ impl App {
             };
             let Some(message) = message else { break };
 
+            // With a sync backend, nothing touches an **account**'s data unless someone is
+            // signed in to it. A command right after sign-in is fine: its disk job queues
+            // behind the switch. What the disk worker reads back before the switch is done
+            // belongs to an **account** that is no longer signed in, and is dropped.
+            let signed_in = auth.is_none() || matches!(state.session, Session::SignedIn { .. });
+            match &message {
+                Message::Command(command) if !signed_in && needs_account(command) => continue,
+                Message::Stored(Ok(output))
+                    if (!signed_in || switches_pending > 0) && is_account_data(output) =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
+
             let mut to_install = Vec::new();
+            // The data of the **account** signed in until now is emptied from `State`.
+            let mut forget_account = false;
+            // Someone signed in to this **account**: its rows are loaded.
+            let mut open_account = None;
             // Installed **addons** whose manifest is fetched again, by stored URL.
             let mut to_refresh = Vec::new();
             // A Real-Debrid key was saved: whether it differs from the one before.
@@ -486,6 +563,113 @@ impl App {
                     mark_skipped(&mut state.addons, &state.settings);
                 }
                 Message::Stored(Ok(StoreOutput::SettingsSaved)) => {}
+                Message::Stored(Ok(StoreOutput::AccountSwitched(switched))) => {
+                    switches_pending -= 1;
+                    // Staying signed in would write rows for the **account** before, so the
+                    // person is signed out with the reason. A later switch already queued
+                    // replaces this one, so its failure no longer matters.
+                    if let Err(error) = switched
+                        && switches_pending == 0
+                        && let Some(auth) = &auth
+                    {
+                        auth_generation += 1;
+                        state.session = Session::Working;
+                        forget_account = true;
+                        let auth = auth.clone();
+                        let text = format!("Could not open this account on this device: {error}");
+                        spawn_auth(&self.sender, auth_generation, async move {
+                            auth.sign_out().await;
+                            AuthEvent::Failed(text)
+                        });
+                    }
+                }
+                Message::Command(
+                    Command::SignUp {
+                        ref email,
+                        ref password,
+                    }
+                    | Command::SignIn {
+                        ref email,
+                        ref password,
+                    },
+                ) => {
+                    if let Some(auth) = &auth
+                        && matches!(state.session, Session::SignedOut { .. })
+                    {
+                        auth_generation += 1;
+                        state.session = Session::Working;
+                        let auth = auth.clone();
+                        let email = email.trim().to_string();
+                        let password = password.clone();
+                        let sign_up = matches!(message, Message::Command(Command::SignUp { .. }));
+                        spawn_auth(&self.sender, auth_generation, async move {
+                            let result = if sign_up {
+                                auth.sign_up(&email, &password).await
+                            } else {
+                                auth.sign_in(&email, &password).await
+                            };
+                            match result {
+                                Ok(account) => AuthEvent::SignedIn {
+                                    account,
+                                    restored: false,
+                                },
+                                Err(text) => AuthEvent::Failed(text),
+                            }
+                        });
+                    }
+                }
+                Message::Command(Command::SignOut) => {
+                    if let Some(auth) = &auth
+                        && matches!(state.session, Session::SignedIn { .. })
+                    {
+                        auth_generation += 1;
+                        state.session = Session::Working;
+                        forget_account = true;
+                        let auth = auth.clone();
+                        spawn_auth(&self.sender, auth_generation, async move {
+                            auth.sign_out().await;
+                            AuthEvent::SignedOut
+                        });
+                    }
+                }
+                Message::Auth { generation, event } if generation == auth_generation => {
+                    match event {
+                        AuthEvent::SignedIn { account, restored } => {
+                            state.session = Session::SignedIn {
+                                email: account.email,
+                            };
+                            forget_account = true;
+                            open_account = Some(account.account_id);
+                            if restored && let Some(auth) = &auth {
+                                // Signed in at once; the refresh only finds out whether the
+                                // server still accepts the session.
+                                spawn_refresh(auth, &self.sender, generation, Duration::ZERO);
+                            }
+                        }
+                        AuthEvent::NoSession | AuthEvent::SignedOut => {
+                            state.session = Session::SignedOut { error: None };
+                        }
+                        AuthEvent::Failed(text) => {
+                            state.session = Session::SignedOut { error: Some(text) };
+                        }
+                        AuthEvent::Refreshed(Ok(()))
+                        | AuthEvent::Refreshed(Err(TokenError::SignedOut)) => {}
+                        AuthEvent::Refreshed(Err(TokenError::Rejected)) => {
+                            auth_generation += 1;
+                            state.session = Session::SignedOut {
+                                error: Some(auth::SIGN_IN_AGAIN.to_string()),
+                            };
+                            forget_account = true;
+                        }
+                        AuthEvent::Refreshed(Err(TokenError::Unavailable)) => {
+                            // Stays signed in, and tries again later.
+                            if let Some(auth) = &auth {
+                                spawn_refresh(auth, &self.sender, generation, REFRESH_RETRY);
+                            }
+                        }
+                    }
+                }
+                Message::Auth { .. } => {}
                 Message::Stored(Ok(StoreOutput::Addons(output))) => {
                     state.addons = output.addons;
                     mark_skipped(&mut state.addons, &state.settings);
@@ -502,6 +686,35 @@ impl App {
                 Message::Stored(Err(text)) => {
                     state.notice = Some(notice(&mut next_notice_id, text));
                 }
+            }
+
+            if forget_account {
+                // Everything from the **account** signed in until now goes, and the answers
+                // still on their way for it are dropped.
+                state = State {
+                    session: state.session.clone(),
+                    notice: state.notice.clone(),
+                    ..State::default()
+                };
+                downloading.clear();
+                catalogs.clear();
+                search_catalogs.clear();
+                manifests.clear();
+                stream_addon_urls.clear();
+                stream_links.clear();
+                home_generation += 1;
+                search_generation += 1;
+                details_generation += 1;
+                streams_generation += 1;
+                playback_generation += 1;
+                held_back_until = None;
+                key_set = false;
+                languages_set = false;
+            }
+            if let Some(account_id) = open_account {
+                switches_pending += 1;
+                let _ = jobs.send(StoreJob::SwitchAccount { account_id });
+                load_account(&jobs);
             }
 
             if let Some(changed) = key_saved {
@@ -633,6 +846,59 @@ impl App {
         drop(jobs);
         let _ = worker.await;
     }
+}
+
+/// Queues the loads of the **account**'s settings, **addons** and library. Settings first, so
+/// the **addons** are listed knowing which ones need a key. The **addon** load also finds out
+/// whether the **account** has no **addon** rows at all, and so gets the default ones.
+fn load_account(jobs: &mpsc::UnboundedSender<StoreJob>) {
+    let _ = jobs.send(StoreJob::Settings(SettingsJob::Load));
+    let _ = jobs.send(StoreJob::Load);
+    let _ = jobs.send(StoreJob::Library(LibraryJob::Load));
+}
+
+/// Commands that read or change an **account**'s data, which need someone signed in.
+fn needs_account(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::SignUp { .. } | Command::SignIn { .. } | Command::SignOut | Command::DismissNotice
+    )
+}
+
+/// What the disk worker read back for an **account**, as opposed to an answer about the
+/// worker itself.
+fn is_account_data(output: &StoreOutput) -> bool {
+    !matches!(
+        output,
+        StoreOutput::AccountSwitched(_) | StoreOutput::SettingsSaved
+    )
+}
+
+/// Runs a request to the sync backend's Auth API in the background, then reports back.
+fn spawn_auth(
+    sender: &mpsc::UnboundedSender<Message>,
+    generation: u64,
+    request: impl Future<Output = AuthEvent> + Send + 'static,
+) {
+    let sender = sender.clone();
+    tokio::spawn(async move {
+        let event = request.await;
+        let _ = sender.send(Message::Auth { generation, event });
+    });
+}
+
+/// Refreshes the access token after `delay`.
+fn spawn_refresh(
+    auth: &Arc<Auth>,
+    sender: &mpsc::UnboundedSender<Message>,
+    generation: u64,
+    delay: Duration,
+) {
+    let auth = auth.clone();
+    spawn_auth(sender, generation, async move {
+        tokio::time::sleep(delay).await;
+        AuthEvent::Refreshed(auth.access_token().await.map(drop))
+    });
 }
 
 /// The disk job for a library command, or `None` when it is ignored: adding with no ready
@@ -993,6 +1259,13 @@ fn run_job(store: &Store, job: StoreJob) -> Result<StoreOutput, StoreError> {
         StoreJob::Remove { url } => store.remove_addon(&url)?,
         StoreJob::Library(job) => return run_library_job(store, job),
         StoreJob::Settings(job) => return run_settings_job(store, job),
+        StoreJob::SwitchAccount { account_id } => {
+            let switched = store
+                .switch_account(&account_id)
+                .map(drop)
+                .map_err(|error| error.to_string());
+            return Ok(StoreOutput::AccountSwitched(switched));
+        }
     }
     let mut addons = Vec::new();
     let mut catalogs = Vec::new();
