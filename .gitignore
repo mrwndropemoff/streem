@@ -1,2 +1,3 @@
 target/
 prototypes/egui-mpv/sample/
+.cargo/config.toml

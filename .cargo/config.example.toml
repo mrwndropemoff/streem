@@ -1,0 +1,5 @@
+# Copy to .cargo/config.toml (gitignored) and fill in the hosted project's values.
+# Use the public key ("anon" or "publishable"), never the service-role or secret key.
+[env]
+STREEM_SUPABASE_URL = "https://<project>.supabase.co"
+STREEM_SUPABASE_KEY = "<public key>"

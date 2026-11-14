@@ -41,12 +41,16 @@ It needs a Supabase login and choices made in its dashboard.
 ## Acceptance checks
 
 - [ ] The five tables exist in the dashboard's table editor, each marked as having row level security enabled.
-- [ ] `./supabase/check-rls.sh` prints `ALL CHECKS PASSED`.
-- [ ] `.cargo/config.toml` exists with both values and contains no service-role key.
-- [ ] "Confirm email" is off.
+- [x] `./supabase/check-rls.sh` prints `ALL CHECKS PASSED`.
+- [x] `.cargo/config.toml` exists with both values and contains no service-role key.
+- [x] "Confirm email" is off.
 
 ## Good to know
 
 A free project is paused after a week with no database activity. Data is kept; restore it from the dashboard.
 
 ## Comments
+
+- 2026-11-14: Project `wgbouvhfqpdjsgslwsah` created and the migration applied in the dashboard. `.cargo/config.toml` holds the Project URL and the publishable key (`sb_publishable_…`), and no secret or service-role key. `./supabase/check-rls.sh` ran against the live project and printed checks 1–6 `ok` and `ALL CHECKS PASSED`. That also shows "Confirm email" is off, because sign-up returned an access token straight away.
+- Not checked from here: the table editor's row level security badge on all five tables (the script only uses `profiles`). The two `streem-check-…@example.com` accounts still need deleting under Authentication → Users.
+- 2026-11-14: The repository is public, so `.cargo/config.toml` is gitignored instead of committed (step 5's "fine while private" doesn't apply). `.cargo/config.example.toml` is the template, and `supabase/README.md` says to copy it. The real file exists only in this checkout.
